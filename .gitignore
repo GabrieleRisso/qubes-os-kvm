@@ -1,0 +1,8 @@
+build/repos/
+build/rpms/
+build/build-*/
+vm-images/*.qcow2
+vm-images/*.iso
+vm-images/*.img
+*.pid
+/tmp/
