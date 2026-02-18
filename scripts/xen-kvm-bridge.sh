@@ -10,6 +10,7 @@
 #
 # Usage:
 #   xen-kvm-bridge.sh define  VM_NAME DISK [MEM_MB] [VCPUS]
+#   xen-kvm-bridge.sh install VM_NAME DISK ISO [MEM_MB] [VCPUS]
 #   xen-kvm-bridge.sh start   VM_NAME
 #   xen-kvm-bridge.sh stop    VM_NAME
 #   xen-kvm-bridge.sh destroy VM_NAME
@@ -17,6 +18,7 @@
 #   xen-kvm-bridge.sh status  VM_NAME
 #   xen-kvm-bridge.sh list
 #   xen-kvm-bridge.sh verify  VM_NAME
+#   xen-kvm-bridge.sh console VM_NAME
 #   xen-kvm-bridge.sh generate-xml VM_NAME DISK [MEM_MB] [VCPUS]
 set -euo pipefail
 
@@ -131,6 +133,164 @@ generate_domain_xml() {
     <seclabel type="dynamic" model="dac" relabel="yes"/>
 </domain>
 XMLEOF
+}
+
+generate_install_xml() {
+    local name="$1"
+    local disk="$2"
+    local iso="$3"
+    local mem="${4:-2048}"
+    local vcpus="${5:-2}"
+    local disk_abs iso_abs
+    disk_abs="$(realpath "$disk" 2>/dev/null || echo "$disk")"
+    iso_abs="$(realpath "$iso" 2>/dev/null || echo "$iso")"
+
+    local disk_type="file"
+    local disk_source_attr="file"
+    local disk_driver_type="qcow2"
+    if [[ "$disk_abs" == /dev/* ]]; then
+        disk_type="block"
+        disk_source_attr="dev"
+        disk_driver_type="raw"
+    elif file "$disk_abs" 2>/dev/null | grep -qi "raw\|data"; then
+        disk_driver_type="raw"
+    fi
+
+    local ovmf=""
+    for f in /usr/share/edk2/ovmf/OVMF_CODE.fd \
+             /usr/share/OVMF/OVMF_CODE.fd \
+             /usr/share/edk2/xen/OVMF.fd; do
+        [[ -f "$f" ]] && ovmf="$f" && break
+    done
+
+    local loader_xml=""
+    if [[ -n "$ovmf" ]]; then
+        loader_xml="<loader readonly=\"yes\" type=\"pflash\">$ovmf</loader>"
+    fi
+
+    cat << XMLEOF
+<domain type="kvm" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
+    <name>$name</name>
+    <memory unit="MiB">$mem</memory>
+    <currentMemory unit="MiB">$mem</currentMemory>
+    <vcpu placement="static">$vcpus</vcpu>
+    <cpu mode="host-passthrough"/>
+    <os>
+        <type arch="x86_64" machine="q35">hvm</type>
+        $loader_xml
+        <boot dev="cdrom"/>
+        <boot dev="hd"/>
+    </os>
+    <features>
+        <pae/>
+        <acpi/>
+        <apic/>
+        <kvm>
+            <hidden state="on"/>
+        </kvm>
+    </features>
+    <clock offset="utc">
+        <timer name="rtc" tickpolicy="catchup"/>
+        <timer name="pit" tickpolicy="delay"/>
+        <timer name="hpet" present="no"/>
+    </clock>
+    <on_poweroff>destroy</on_poweroff>
+    <on_reboot>destroy</on_reboot>
+    <on_crash>destroy</on_crash>
+    <devices>
+        <emulator>/usr/bin/qemu-system-x86_64</emulator>
+        <disk type="$disk_type" device="disk">
+            <driver name="qemu" type="$disk_driver_type" cache="none"/>
+            <source ${disk_source_attr}="${disk_abs}"/>
+            <target dev="vda" bus="virtio"/>
+        </disk>
+        <disk type="file" device="cdrom">
+            <driver name="qemu" type="raw"/>
+            <source file="${iso_abs}"/>
+            <target dev="sda" bus="sata"/>
+            <readonly/>
+        </disk>
+        <interface type="user">
+            <model type="virtio"/>
+        </interface>
+        <console type="pty">
+            <target type="serial" port="0"/>
+        </console>
+        <serial type="pty">
+            <target port="0"/>
+        </serial>
+        <channel type="unix">
+            <target type="virtio" name="org.qemu.guest_agent.0"/>
+        </channel>
+        <channel type="unix">
+            <source mode="bind" path="/var/run/qubes/qubesdb.${name}.sock"/>
+            <target type="virtio" name="org.qubes-os.qubesdb"/>
+        </channel>
+        <vsock model="virtio">
+            <cid auto="yes"/>
+        </vsock>
+        <memballoon model="virtio">
+            <stats period="5"/>
+        </memballoon>
+        <rng model="virtio">
+            <backend model="random">/dev/urandom</backend>
+        </rng>
+        <input type="tablet" bus="virtio"/>
+        <input type="keyboard" bus="virtio"/>
+    </devices>
+    <qemu:commandline>
+        <qemu:arg value="-accel"/>
+        <qemu:arg value="kvm,xen-version=$XEN_VERSION,kernel-irqchip=split"/>
+        <qemu:arg value="-cpu"/>
+        <qemu:arg value="host,+xen-vapic"/>
+    </qemu:commandline>
+    <seclabel type="dynamic" model="dac" relabel="yes"/>
+</domain>
+XMLEOF
+}
+
+cmd_install() {
+    local name="${1:?Usage: $0 install VM_NAME DISK ISO [MEM_MB] [VCPUS]}"
+    local disk="${2:?Usage: $0 install VM_NAME DISK ISO [MEM_MB] [VCPUS]}"
+    local iso="${3:?Usage: $0 install VM_NAME DISK ISO [MEM_MB] [VCPUS]}"
+    local mem="${4:-2048}"
+    local vcpus="${5:-2}"
+
+    [[ -e "$disk" ]] || die "Disk image not found: $disk"
+    [[ -e "$iso" ]]  || die "ISO not found: $iso"
+
+    if $VIRSH dominfo "$name" &>/dev/null; then
+        info "Domain '$name' already defined. Undefining first..."
+        $VIRSH destroy "$name" 2>/dev/null || true
+        $VIRSH undefine "$name" --nvram 2>/dev/null || $VIRSH undefine "$name" 2>/dev/null || true
+    fi
+
+    info "Defining Xen-on-KVM install domain: $name (with CDROM)"
+    local xml
+    xml="$(generate_install_xml "$name" "$disk" "$iso" "$mem" "$vcpus")"
+    echo "$xml" | $VIRSH define /dev/stdin
+
+    info "Starting domain '$name' for installation..."
+    $VIRSH start "$name"
+    info "Domain '$name' started with CDROM. Connect with:"
+    info "  $0 console $name"
+    info "After install, undefine and redefine without CDROM:"
+    info "  $0 undefine $name"
+    info "  $0 define $name $disk $mem $vcpus"
+}
+
+cmd_console() {
+    local name="${1:?Usage: $0 console VM_NAME}"
+    if ! $VIRSH dominfo "$name" &>/dev/null; then
+        die "Domain '$name' not defined."
+    fi
+    local state
+    state=$($VIRSH domstate "$name" 2>/dev/null || echo "shut off")
+    if [[ "$state" != "running" ]]; then
+        die "Domain '$name' is not running (state: $state). Start it first."
+    fi
+    info "Connecting to serial console of '$name' (Ctrl+] to exit)..."
+    $VIRSH console "$name"
 }
 
 cmd_define() {
@@ -335,6 +495,7 @@ shift
 
 case "$ACTION" in
     define)       cmd_define "$@" ;;
+    install)      cmd_install "$@" ;;
     start)        cmd_start "$@" ;;
     stop)         cmd_stop "$@" ;;
     destroy)      cmd_destroy "$@" ;;
@@ -342,10 +503,11 @@ case "$ACTION" in
     status)       cmd_status "$@" ;;
     list)         cmd_list ;;
     verify)       cmd_verify "$@" ;;
+    console)      cmd_console "$@" ;;
     generate-xml) cmd_generate_xml "$@" ;;
     *)
         echo "Unknown action: $ACTION"
-        echo "Usage: $0 <define|start|stop|destroy|undefine|status|list|verify|generate-xml> [args...]"
+        echo "Usage: $0 <define|install|start|stop|destroy|undefine|status|list|verify|console|generate-xml> [args...]"
         exit 1
         ;;
 esac
