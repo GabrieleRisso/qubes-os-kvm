@@ -36,9 +36,11 @@ generate_domain_xml() {
     disk_abs="$(realpath "$disk" 2>/dev/null || echo "$disk")"
 
     local disk_type="file"
+    local disk_source_attr="file"
     local disk_driver_type="qcow2"
     if [[ "$disk_abs" == /dev/* ]]; then
         disk_type="block"
+        disk_source_attr="dev"
         disk_driver_type="raw"
     elif file "$disk_abs" 2>/dev/null | grep -qi "raw\|data"; then
         disk_driver_type="raw"
@@ -63,9 +65,7 @@ generate_domain_xml() {
     <memory unit="MiB">$mem</memory>
     <currentMemory unit="MiB">$mem</currentMemory>
     <vcpu placement="static">$vcpus</vcpu>
-    <cpu mode="host-passthrough">
-        <feature name="invtsc" policy="require"/>
-    </cpu>
+    <cpu mode="host-passthrough"/>
     <os>
         <type arch="x86_64" machine="q35">hvm</type>
         $loader_xml
@@ -91,7 +91,7 @@ generate_domain_xml() {
         <emulator>/usr/bin/qemu-system-x86_64</emulator>
         <disk type="$disk_type" device="disk">
             <driver name="qemu" type="$disk_driver_type" cache="none"/>
-            <source ${disk_type}="${disk_abs}"/>
+            <source ${disk_source_attr}="${disk_abs}"/>
             <target dev="vda" bus="virtio"/>
         </disk>
         <interface type="user">
@@ -106,20 +106,27 @@ generate_domain_xml() {
         <channel type="unix">
             <target type="virtio" name="org.qemu.guest_agent.0"/>
         </channel>
+        <channel type="unix">
+            <source mode="bind" path="/var/run/qubes/qubesdb.${name}.sock"/>
+            <target type="virtio" name="org.qubes-os.qubesdb"/>
+        </channel>
+        <vsock model="virtio">
+            <cid auto="yes"/>
+        </vsock>
         <memballoon model="virtio">
             <stats period="5"/>
         </memballoon>
         <rng model="virtio">
             <backend model="random">/dev/urandom</backend>
         </rng>
+        <input type="tablet" bus="virtio"/>
+        <input type="keyboard" bus="virtio"/>
     </devices>
     <qemu:commandline>
         <qemu:arg value="-accel"/>
-        <qemu:arg value="kvm,xen-version=$XEN_VERSION,kernel-irqchip=split,xen-evtchn=on,xen-gnttab=on"/>
+        <qemu:arg value="kvm,xen-version=$XEN_VERSION,kernel-irqchip=split"/>
         <qemu:arg value="-cpu"/>
         <qemu:arg value="host,+xen-vapic"/>
-        <qemu:arg value="-global"/>
-        <qemu:arg value="virtio-pci.ioeventfd=off"/>
     </qemu:commandline>
     <seclabel type="dynamic" model="dac" relabel="yes"/>
 </domain>
@@ -202,7 +209,7 @@ cmd_undefine() {
         die "Domain '$name' is running. Stop it first."
     fi
     info "Undefining domain: $name"
-    $VIRSH undefine "$name"
+    $VIRSH undefine "$name" --nvram 2>/dev/null || $VIRSH undefine "$name"
     info "Domain '$name' removed."
 }
 

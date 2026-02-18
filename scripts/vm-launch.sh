@@ -55,7 +55,7 @@ accel_flags() {
 xen_accel_flags() {
     if [[ "$ACCEL" == "kvm" ]]; then
         if [[ "$HOST_ARCH" == "aarch64" ]]; then
-            echo "-accel kvm,xen-version=0x40011,xen-evtchn=on,xen-gnttab=on -cpu host"
+            echo "-accel kvm,xen-version=0x40011 -cpu host"
         else
             echo "-accel kvm,xen-version=0x40013,kernel-irqchip=split -cpu host,+xen-vapic"
         fi

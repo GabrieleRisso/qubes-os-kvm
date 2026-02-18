@@ -1,5 +1,5 @@
 # qubes-kvm-fork build environment
-# Based on Fedora 41 to match Qubes OS 4.3 dom0
+# Based on Fedora 42 to match kvm-dev StandaloneVM
 
 FROM registry.fedoraproject.org/fedora:42
 

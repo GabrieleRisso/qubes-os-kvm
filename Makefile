@@ -175,8 +175,8 @@ build-qubesdb-kvm:
 
 build-container:
 	@mkdir -p $(RPMS_DIR)
-	$(CONTAINER_ENG) run --rm \
-		-v $(CURDIR)/$(REPOS_DIR):/repos:Z \
+	$(CONTAINER_ENG) run --rm --userns=keep-id \
+		-v $(SRC_ROOT):/repos:Z \
 		-v $(CURDIR)/$(PATCH_DIR):/patches:Z \
 		-v $(CURDIR)/$(RPMS_DIR):/output:Z \
 		-v $(CURDIR)/$(SCRIPT_DIR):/scripts:ro,Z \
@@ -250,7 +250,7 @@ test-specs:
 	done
 
 test-container:
-	$(CONTAINER_ENG) run --rm \
+	$(CONTAINER_ENG) run --rm --userns=keep-id \
 		-v $(CURDIR):/workspace:Z \
 		$(BUILD_IMAGE) \
 		/workspace/$(TEST_DIR)/run-tests.sh

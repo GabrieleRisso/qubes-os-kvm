@@ -175,7 +175,7 @@ case "$ACTION" in
         QEMU_BIN="${QEMU:-qemu-system-aarch64}"
 
         $QEMU_BIN \
-            -accel kvm,xen-version=0x40011,xen-evtchn=on,xen-gnttab=on \
+            -accel kvm,xen-version=0x40011 \
             -cpu host \
             -M virt,gic-version=3 \
             -m "$MEM" \
