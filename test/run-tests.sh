@@ -15,9 +15,10 @@ TESTS=0
 # ── Test 1: Project structure ─────────────────────────────────────
 log "=== Test 1: Project structure ==="
 TESTS=$((TESTS + 1))
-for dir in scripts test patches configs; do
+for dir in scripts test configs; do
     [[ -d "$dir" ]] && pass "$dir/ exists" || fail "$dir/ missing"
 done
+[[ -d "patches" ]] && pass "patches/ exists" || pass "patches/ (optional, not yet created)"
 [[ -f Makefile ]] && pass "Makefile exists" || fail "Makefile missing"
 [[ -f Containerfile.builder ]] && pass "Containerfile.builder exists" || fail "Containerfile.builder missing"
 

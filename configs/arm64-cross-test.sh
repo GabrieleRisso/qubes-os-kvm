@@ -21,7 +21,9 @@ case "$ACTION" in
             log "Cross-compiler: $(aarch64-linux-gnu-gcc --version | head -1)"
         else
             log "Cross-compiler: NOT INSTALLED"
-            log "  Install: pacman -S aarch64-linux-gnu-gcc"
+            log "  Fedora: sudo dnf install gcc-aarch64-linux-gnu"
+            log "  Arch:   sudo pacman -S aarch64-linux-gnu-gcc"
+            log "  Debian: sudo apt install gcc-aarch64-linux-gnu"
         fi
 
         # QEMU user-mode (for running ARM64 binaries on x86)
@@ -30,7 +32,8 @@ case "$ACTION" in
             log "QEMU user-mode: available"
         else
             log "QEMU user-mode: NOT INSTALLED"
-            log "  Install: pacman -S qemu-user-static"
+            log "  Fedora: sudo dnf install qemu-user-static"
+            log "  Arch:   sudo pacman -S qemu-user-static"
         fi
 
         # QEMU system-mode (for full ARM64 VM)
@@ -38,15 +41,17 @@ case "$ACTION" in
             log "QEMU system aarch64: $(qemu-system-aarch64 --version | head -1)"
         else
             log "QEMU system aarch64: NOT INSTALLED"
-            log "  Install: pacman -S qemu-system-aarch64"
+            log "  Fedora: sudo dnf install qemu-system-aarch64-core"
+            log "  Arch:   sudo pacman -S qemu-system-aarch64"
         fi
 
         # Rust ARM64 target
-        if rustup target list --installed 2>/dev/null | grep -q aarch64; then
+        if command -v rustup &>/dev/null && rustup target list --installed 2>/dev/null | grep -q aarch64; then
             log "Rust aarch64 target: installed"
+        elif command -v rustc &>/dev/null; then
+            log "Rust available (system package, no rustup for cross-targets)"
         else
-            log "Rust aarch64 target: NOT INSTALLED"
-            log "  Install: rustup target add aarch64-unknown-linux-gnu"
+            log "Rust: NOT INSTALLED"
         fi
         ;;
 
@@ -56,23 +61,27 @@ case "$ACTION" in
         TESTDIR=$(mktemp -d)
         trap 'rm -rf "$TESTDIR"' EXIT
 
-        # Simple C test
-        cat > "$TESTDIR/hello.c" << 'CEOF'
-#include <stdio.h>
-int main() {
-    printf("Hello from ARM64! (cross-compiled)\n");
-    #ifdef __aarch64__
-    printf("Architecture: aarch64 confirmed\n");
-    #endif
-    return 0;
-}
-CEOF
+        # Freestanding asm test (no libc sysroot needed)
+        cat > "$TESTDIR/hello.S" << 'AEOF'
+.global _start
+.section .text
+_start:
+    mov x8, #64
+    mov x0, #1
+    adr x1, msg
+    mov x2, #28
+    svc #0
+    mov x8, #93
+    mov x0, #0
+    svc #0
+.section .rodata
+msg: .ascii "Hello from ARM64! (cross-compiled)\n"
+AEOF
 
-        log "Compiling for ARM64..."
-        aarch64-linux-gnu-gcc -static -o "$TESTDIR/hello-arm64" "$TESTDIR/hello.c"
+        log "Compiling for ARM64 (freestanding)..."
+        aarch64-linux-gnu-gcc -nostdlib -static -o "$TESTDIR/hello-arm64" "$TESTDIR/hello.S"
         log "Binary: $(file "$TESTDIR/hello-arm64")"
 
-        # Try running via qemu-user if available
         if command -v qemu-aarch64-static &>/dev/null; then
             log "Running via qemu-aarch64-static..."
             qemu-aarch64-static "$TESTDIR/hello-arm64"

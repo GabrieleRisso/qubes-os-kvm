@@ -26,14 +26,7 @@ if [[ -e /dev/kvm ]]; then
 else
     log "  /dev/kvm: NOT FOUND"
     log ""
-    log "  Troubleshooting:"
-    log "  1. Did you reboot dom0 after adding 'hap=1 nestedhvm=1' to Xen config?"
-    log "  2. Is the VM in HVM mode? (qvm-prefs kvm-dev virt_mode → should be 'hvm')"
-    log "  3. Is the libvirt XML override in place?"
-    log "     Check dom0: cat /etc/qubes/templates/libvirt/xen/by-name/kvm-dev.xml"
-    log "  4. Does your CPU support VMX? Check dom0: grep vmx /proc/cpuinfo"
-    log ""
-    log "  Trying to load kvm modules anyway..."
+    log "  Trying to load kvm modules..."
     sudo modprobe kvm 2>/dev/null || true
     sudo modprobe kvm_intel 2>/dev/null || sudo modprobe kvm_amd 2>/dev/null || true
 
@@ -41,7 +34,28 @@ else
         log "  /dev/kvm: NOW AVAILABLE (after modprobe)"
     else
         log "  /dev/kvm: STILL NOT AVAILABLE"
-        log "  Continuing without KVM (TCG mode only)."
+        log ""
+        log "  Troubleshooting:"
+        log "  1. Did you reboot dom0 after adding 'hap=1 nestedhvm=1' to Xen config?"
+        log "     Check from visyble: qvm-remote \"xl info | grep xen_commandline\""
+        log "  2. Is the VM in HVM mode?"
+        log "     Check from visyble: qvm-remote \"qvm-prefs kvm-dev virt_mode\""
+        log "     Must be 'hvm', not 'pvh'."
+        log "  3. Is the libvirt XML override in place?"
+        log "     Check from visyble: qvm-remote \"cat /etc/qubes/templates/libvirt/xen/by-name/kvm-dev.xml\""
+        log "  4. Does Xen report HVM capability?"
+        log "     Check from visyble: qvm-remote \"xl info | grep virt_caps\""
+        log "     Should contain 'hvm' and 'hap'."
+        log "     NOTE: /proc/cpuinfo in dom0 may NOT show vmx on newer CPUs"
+        log "     (Arrow Lake, etc.) because Xen consumes the flag."
+        log "  5. Is the VM using its own kernel (not Qubes-provided)?"
+        log "     Check from visyble: qvm-remote \"qvm-prefs kvm-dev kernel\""
+        log "     Should be empty (VM-provided)."
+        log ""
+        log "  Loaded kvm modules:"
+        lsmod | grep kvm 2>/dev/null || log "    (none)"
+        log ""
+        log "  Continuing without KVM (TCG software emulation mode)."
         log "  Fix the dom0 config and try again."
     fi
 fi
@@ -90,10 +104,11 @@ case "$PKG" in
             \
             cargo rust \
             \
+            gcc-aarch64-linux-gnu \
+            \
             grub2-efi-x64 grub2-tools shim-x64 kernel \
             || true
 
-        # ARM64 packages (may not be available on all Fedora versions)
         sudo dnf install -y \
             qemu-system-aarch64-core qemu-user-static edk2-aarch64 \
             2>/dev/null || log "  INFO: Some ARM64 packages not available"

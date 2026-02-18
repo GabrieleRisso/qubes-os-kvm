@@ -25,12 +25,13 @@ check_remote() {
         log "Install it first, or run dom0 commands manually."
         exit 1
     fi
-    # Quick connectivity check
-    if ! qvm-remote ping &>/dev/null; then
+    # Quick connectivity check — run a trivial command in dom0.
+    # NOTE: 'qvm-remote ping' / '--ping' may not work on all versions;
+    # a simple echo is the most reliable way to verify the link.
+    if ! qvm-remote "echo dom0-ok" 2>/dev/null | grep -q "dom0-ok"; then
         log "ERROR: qvm-remote cannot reach dom0"
-        log "Set up authentication first:"
-        log "  qvm-remote key gen"
-        log "  # Then in dom0: qvm-remote-dom0 authorize visyble <KEY>"
+        log "Verify the dom0 daemon is running and this VM is authorized."
+        log "  In dom0: systemctl status qvm-remote-dom0"
         exit 1
     fi
 }
@@ -82,9 +83,9 @@ case "${1:-help}" in
         check_remote
         ensure_vm_running
 
-        # qvm-copy-to-vm is the standard Qubes VM-to-VM file transfer.
-        # It does NOT go through dom0 — it's a direct VM-to-VM copy.
-        # Files arrive in ~/QubesIncoming/<source-vm>/ inside the target.
+        # Transfer via dom0 relay: visyble -> dom0 /tmp -> kvm-dev
+        # qvm-copy-to-vm opens a GUI dialog and hangs in non-interactive use.
+        # Instead we use dom0 as an intermediary: pull from this VM, push to target.
         log "Creating project archive..."
         TMPTAR="/tmp/qubes-kvm-fork-deploy.tar.gz"
         tar czf "$TMPTAR" \
@@ -95,14 +96,16 @@ case "${1:-help}" in
             --exclude='.git' \
             "$(basename "$PROJECT_DIR")"
 
-        log "Copying to $VM_NAME via qvm-copy-to-vm..."
-        qvm-copy-to-vm "$VM_NAME" "$TMPTAR"
-        rm -f "$TMPTAR"
+        LOCAL_VM=$(hostname 2>/dev/null || echo "visyble")
+        log "Pulling archive to dom0 (relay)..."
+        qvm-remote "qvm-run --pass-io --no-gui $LOCAL_VM -- cat $TMPTAR > /tmp/deploy-relay.tar.gz"
 
-        # Now extract inside kvm-dev (via dom0 qvm-run)
-        local_vm=$(hostname 2>/dev/null || echo "visyble")
-        log "Extracting inside $VM_NAME..."
-        qvm-remote "qvm-run --pass-io --no-gui $VM_NAME -- bash -c 'cd /home/user && tar xzf ~/QubesIncoming/${local_vm}/qubes-kvm-fork-deploy.tar.gz && rm -rf ~/QubesIncoming/${local_vm}/qubes-kvm-fork-deploy.tar.gz'"
+        log "Pushing to $VM_NAME and extracting..."
+        qvm-remote "cat /tmp/deploy-relay.tar.gz | qvm-run --pass-io --no-gui $VM_NAME -- bash -c 'cat > /tmp/deploy.tar.gz && cd /home/user && tar xzf /tmp/deploy.tar.gz && rm /tmp/deploy.tar.gz'"
+
+        log "Cleaning up relay..."
+        qvm-remote "rm -f /tmp/deploy-relay.tar.gz"
+        rm -f "$TMPTAR"
 
         log "Project deployed to $VM_NAME:/home/user/qubes-kvm-fork/"
         log ""
@@ -158,8 +161,8 @@ case "${1:-help}" in
         check_remote
         ensure_vm_running
 
-        log "Running test suite..."
-        qvm-remote "qvm-run --pass-io --no-gui $VM_NAME -- bash -c 'cd /home/user/qubes-kvm-fork && bash test/run-tests.sh .'"
+        log "Running granular probe suite..."
+        qvm-remote -t 60 "qvm-run --pass-io --no-gui $VM_NAME -- bash -c 'cd /home/user/qubes-kvm-fork && bash test/granular-probes.sh all'"
         ;;
 
     xen-test)
@@ -169,7 +172,7 @@ case "${1:-help}" in
 
         log "This boots a VM inside kvm-dev where the guest sees Xen 4.19."
         log "It's the core proof-of-concept for the entire architecture."
-        qvm-remote -t 120 "qvm-run --pass-io --no-gui $VM_NAME -- bash -c 'cd /home/user/qubes-kvm-fork && bash configs/xen-on-kvm-test.sh ~/vm-images/test-fedora.qcow2'"
+        qvm-remote -t 120 "qvm-run --pass-io --no-gui $VM_NAME -- bash -c 'cd /home/user/qubes-kvm-fork && bash test/granular-probes.sh p2'"
         ;;
 
     arm-test)
@@ -177,7 +180,7 @@ case "${1:-help}" in
         check_remote
         ensure_vm_running
 
-        qvm-remote "qvm-run --pass-io --no-gui $VM_NAME -- bash -c 'cd /home/user/qubes-kvm-fork && bash configs/arm64-cross-test.sh check && bash configs/arm64-cross-test.sh compile-test'"
+        qvm-remote -t 60 "qvm-run --pass-io --no-gui $VM_NAME -- bash -c 'cd /home/user/qubes-kvm-fork && bash test/granular-probes.sh p1 && bash test/granular-probes.sh p3'"
         ;;
 
     build)
@@ -232,7 +235,6 @@ case "${1:-help}" in
         check_remote
         ensure_vm_running
 
-        # Use qvm-copy-to-vm for reliable VM-to-VM transfer
         TMPTAR="/tmp/qubes-kvm-fork-sync.tar.gz"
         tar czf "$TMPTAR" \
             -C "$(dirname "$PROJECT_DIR")" \
@@ -241,11 +243,11 @@ case "${1:-help}" in
             --exclude='.git' \
             "$(basename "$PROJECT_DIR")"
 
-        qvm-copy-to-vm "$VM_NAME" "$TMPTAR"
+        LOCAL_VM=$(hostname 2>/dev/null || echo "visyble")
+        qvm-remote "qvm-run --pass-io --no-gui $LOCAL_VM -- cat $TMPTAR > /tmp/sync-relay.tar.gz"
+        qvm-remote "cat /tmp/sync-relay.tar.gz | qvm-run --pass-io --no-gui $VM_NAME -- bash -c 'cat > /tmp/sync.tar.gz && cd /home/user && tar xzf /tmp/sync.tar.gz && rm /tmp/sync.tar.gz'"
+        qvm-remote "rm -f /tmp/sync-relay.tar.gz"
         rm -f "$TMPTAR"
-
-        local_vm=$(hostname 2>/dev/null || echo "visyble")
-        qvm-remote "qvm-run --pass-io --no-gui $VM_NAME -- bash -c 'cd /home/user && tar xzf ~/QubesIncoming/${local_vm}/qubes-kvm-fork-sync.tar.gz && rm -rf ~/QubesIncoming/${local_vm}/qubes-kvm-fork-sync.tar.gz'"
 
         log "Synced."
         ;;

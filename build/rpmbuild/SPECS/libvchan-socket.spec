@@ -1,0 +1,86 @@
+#
+# The Qubes OS Project, http://www.qubes-os.org
+#
+# Copyright (C) 2020  Paweł Marczewski  <pawel@invisiblethingslab.com>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+#
+#
+
+Name:		qubes-libvchan-socket
+Version:	4.1.0
+Release:	1%{dist}
+
+Summary:	Qubes vchan libraries, socket version
+License:	GPL v2 only
+Group:		Qubes
+Vendor:		Invisible Things Lab
+URL:		http://www.qubes-os.org
+BuildRequires: gcc
+Provides:	qubes-libvchan = %{version}-%{release}
+Provides:	qubes-core-libs = %{version}-%{release}
+Conflicts:	qubes-libvchan-xen
+Source0:    %{name}-%{version}.tar.gz
+
+%description
+Socket version of Qubes vchan communication library.
+Drop-in replacement for qubes-libvchan-xen for KVM-based deployments.
+
+%prep
+%setup -q
+
+%build
+%set_build_flags
+export LIBDIR=%{_libdir}
+export INCLUDEDIR=%{_includedir}
+make all
+
+%install
+export LIBDIR=%{_libdir}
+export INCLUDEDIR=%{_includedir}
+make DESTDIR=$RPM_BUILD_ROOT install
+
+%clean
+rm -rf $RPM_BUILD_ROOT
+rm -f %{name}-%{version}
+
+%files
+%{_libdir}/libvchan-socket.so
+%{_libdir}/libvchan-socket-simple.so
+
+%package devel
+Summary:        Include files for qubes vchan libraries, socket version
+License:        GPL v2 only
+Group:          Development/Sources
+Requires:       %{name} = %{version}-%{release}
+Requires:       pkgconfig
+Provides:       qubes-libvchan-devel = %{version}-%{release}
+Provides:       qubes-core-vm-devel = %{version}-%{release}
+Provides:       qubes-core-libs-devel = %{version}-%{release}
+Conflicts:      qubes-libvchan-xen-devel
+
+%description devel
+Development headers and pkg-config files for the socket-based vchan library.
+
+%files devel
+%{_includedir}/vchan-socket/libvchan.h
+%{_libdir}/pkgconfig/vchan-socket.pc
+%{_libdir}/pkgconfig/vchan.pc
+%{_includedir}/vchan-socket-simple/libvchan.h
+%{_libdir}/pkgconfig/vchan-socket-simple.pc
+
+%changelog
+* Wed Feb 18 2026 Builder - 4.1.0-1
+- KVM vchan-socket build

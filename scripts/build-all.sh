@@ -1,124 +1,280 @@
 #!/bin/bash
 # build-all.sh — Build patched Qubes components for KVM backend
-# Runs inside the builder container
+#
+# Works in two modes:
+#   1. Container mode: repos mounted at /repos, output at /output
+#   2. Local mode: repos as sibling directories (auto-detected)
+#
+# Usage:
+#   ./scripts/build-all.sh              # auto-detect mode
+#   ./scripts/build-all.sh /path/to/src # explicit source root
 set -euo pipefail
 
-REPOS_DIR="/repos"
-PATCHES_DIR="/patches"
-OUTPUT_DIR="/output"
-BACKEND_VMM="kvm"
-
+BACKEND_VMM="${BACKEND_VMM:-kvm}"
 export BACKEND_VMM
 
 log() { echo "[build] $*"; }
+ok()  { echo "  OK: $*"; }
+err() { echo "  ERR: $*"; }
 
-# Phase 1: Apply patches to repos
+# Determine repo layout
+if [[ -d "/repos/qubes-core-vchan-socket" ]]; then
+    REPOS_DIR="/repos"
+    PATCHES_DIR="${PATCHES_DIR:-/patches}"
+    OUTPUT_DIR="${OUTPUT_DIR:-/output}"
+    MODE="container"
+elif [[ -n "${1:-}" && -d "$1/qubes-core-vchan-socket" ]]; then
+    REPOS_DIR="$1"
+    PATCHES_DIR="${PATCHES_DIR:-$(dirname "$0")/../patches}"
+    OUTPUT_DIR="${OUTPUT_DIR:-$(dirname "$0")/../build/rpms}"
+    MODE="local-explicit"
+else
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    SRC_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
+    if [[ -d "$SRC_ROOT/qubes-core-vchan-socket" ]]; then
+        REPOS_DIR="$SRC_ROOT"
+        PATCHES_DIR="${PATCHES_DIR:-$SCRIPT_DIR/../patches}"
+        OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/../build/rpms}"
+        MODE="local-sibling"
+    else
+        log "Cannot find repos. Run from project dir or pass path."
+        exit 1
+    fi
+fi
+
+log "=== qubes-kvm-fork build ==="
+log "Backend VMM: $BACKEND_VMM"
+log "Mode: $MODE"
+log "Repos: $REPOS_DIR"
+log ""
+
+BUILT=0
+FAILED=0
+
+try_build() {
+    local name="$1"
+    shift
+    log "Building $name..."
+    if "$@" 2>&1; then
+        ok "$name"
+        BUILT=$((BUILT + 1))
+    else
+        err "$name"
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+# ── Phase 1: Apply patches (container mode only) ─────────────────
 apply_patches() {
-    log "Applying patches..."
+    [[ -d "$PATCHES_DIR" ]] || return 0
+    log "Checking for patches..."
     for pdir in "$PATCHES_DIR"/*/; do
         [[ -d "$pdir" ]] || continue
         component=$(basename "$pdir")
         repo_dir="$REPOS_DIR/$component"
-
-        if [[ ! -d "$repo_dir" ]]; then
-            log "  SKIP $component (repo not cloned)"
-            continue
-        fi
+        [[ -d "$repo_dir" ]] || { log "  SKIP $component (not found)"; continue; }
 
         patch_count=$(find "$pdir" -name "*.patch" 2>/dev/null | wc -l)
-        if [[ "$patch_count" -eq 0 ]]; then
-            log "  SKIP $component (no patches)"
-            continue
-        fi
+        [[ "$patch_count" -gt 0 ]] || continue
 
-        log "  $component: applying $patch_count patches..."
+        log "  $component: $patch_count patches"
         cd "$repo_dir"
-
-        # Create a branch for our patches
         git checkout -B kvm-fork 2>/dev/null || true
-
         for patch in "$pdir"*.patch; do
             patch_name=$(basename "$patch")
             if git am --check "$patch" 2>/dev/null; then
                 git am "$patch"
-                log "    OK: $patch_name"
+                log "    Applied: $patch_name"
             else
-                log "    SKIP: $patch_name (already applied or conflict)"
+                log "    Skip: $patch_name (already applied or conflict)"
             fi
         done
     done
 }
 
-# Phase 2: Build vchan-socket (the KVM communication layer)
+# ── Phase 2: Build vchan-socket ──────────────────────────────────
 build_vchan_socket() {
-    local repo="$REPOS_DIR/qubes-core-vchan-socket"
-    if [[ ! -d "$repo" ]]; then
-        log "SKIP vchan-socket (not cloned)"
-        return
-    fi
-    log "Building vchan-socket..."
-    cd "$repo"
-    make clean 2>/dev/null || true
-    make
-    log "  vchan-socket: OK"
+    local dir="$REPOS_DIR/qubes-core-vchan-socket"
+    [[ -d "$dir" ]] || { log "SKIP vchan-socket (not found)"; return; }
+    try_build "vchan-socket" make -C "$dir" clean all
 }
 
-# Phase 3: Build qrexec (RPC framework)
-build_qrexec() {
-    local repo="$REPOS_DIR/qubes-core-qrexec"
-    if [[ ! -d "$repo" ]]; then
-        log "SKIP qrexec (not cloned)"
-        return
+# ── Phase 3: Build full qubesdb with KVM daemon ─────────────────
+build_qubesdb() {
+    local dir="$REPOS_DIR/qubes-core-qubesdb"
+    [[ -d "$dir" ]] || { log "SKIP qubesdb (not found)"; return; }
+
+    # vchan-socket headers/libs must be discoverable
+    local vchan_dir="$REPOS_DIR/qubes-core-vchan-socket"
+    if [[ -d "$vchan_dir" ]]; then
+        export PKG_CONFIG_PATH="${vchan_dir}:${PKG_CONFIG_PATH:-}"
+        export CFLAGS="${CFLAGS:-} -I${vchan_dir}/include"
+        export LDFLAGS="${LDFLAGS:-} -L${vchan_dir}"
     fi
-    log "Building qrexec..."
-    cd "$repo"
-    if [[ -f Makefile ]]; then
-        make BACKEND_VMM=kvm 2>&1 | tail -5 || log "  qrexec: build issues (expected at this stage)"
+
+    # Build the KVM-specific inject/read tools
+    local kvm_dir="$dir/daemon/kvm"
+    if [[ -d "$kvm_dir" ]]; then
+        try_build "qubesdb-config-inject + qubesdb-config-read" \
+            make -C "$kvm_dir" BACKEND_VMM=kvm clean all
+
+        # Verify binaries were produced
+        local ok_count=0
+        for bin in qubesdb-config-inject qubesdb-config-read; do
+            if [[ -x "$kvm_dir/$bin" ]]; then
+                ok "$bin binary exists"
+                ok_count=$((ok_count + 1))
+            else
+                err "$bin binary not found after build"
+            fi
+        done
+        [[ $ok_count -eq 2 ]] || FAILED=$((FAILED + 1))
+    else
+        log "  SKIP qubesdb KVM daemons (daemon/kvm dir not found)"
+    fi
+
+    # Build the main qubesdb library and daemons with KVM backend
+    if [[ -f "$dir/Makefile" ]]; then
+        try_build "qubesdb (full, BACKEND_VMM=kvm)" \
+            make -C "$dir" BACKEND_VMM=kvm
     fi
 }
 
-# Phase 4: Build core-admin (VM management daemon)
-build_core_admin() {
-    local repo="$REPOS_DIR/qubes-core-admin"
-    if [[ ! -d "$repo" ]]; then
-        log "SKIP core-admin (not cloned)"
-        return
+# ── Phase 4: Build gui-daemon ────────────────────────────────────
+build_gui_daemon() {
+    local dir="$REPOS_DIR/qubes-gui-daemon"
+    [[ -d "$dir" ]] || { log "SKIP gui-daemon (not found)"; return; }
+    if [[ -f "$dir/Makefile" ]]; then
+        try_build "gui-daemon (BACKEND_VMM=kvm)" \
+            make -C "$dir" BACKEND_VMM=kvm
+    else
+        log "  SKIP gui-daemon (no Makefile)"
     fi
-    log "Building core-admin..."
-    cd "$repo"
-    python3 setup.py build 2>&1 | tail -5 || log "  core-admin: build issues (expected at this stage)"
 }
 
-# Phase 5: Build summary
+# ── Phase 5: Build gui-agent-linux ───────────────────────────────
+build_gui_agent() {
+    local dir="$REPOS_DIR/qubes-gui-agent-linux"
+    [[ -d "$dir" ]] || { log "SKIP gui-agent-linux (not found)"; return; }
+    if [[ -f "$dir/Makefile" ]]; then
+        try_build "gui-agent-linux (BACKEND_VMM=kvm)" \
+            make -C "$dir" BACKEND_VMM=kvm
+    else
+        log "  SKIP gui-agent-linux (no Makefile)"
+    fi
+}
+
+# ── Phase 6: Build core-agent-linux ──────────────────────────────
+build_core_agent() {
+    local dir="$REPOS_DIR/qubes-core-agent-linux"
+    [[ -d "$dir" ]] || { log "SKIP core-agent-linux (not found)"; return; }
+
+    # Validate shell scripts first
+    log "Validating agent KVM scripts..."
+    local fail=0
+    for f in init/hypervisor.sh init/qubes-domain-id.sh \
+             network/qubesdb-hotplug-watcher.sh \
+             network/vif-route-qubes-kvm; do
+        if [[ -f "$dir/$f" ]]; then
+            if bash -n "$dir/$f" 2>/dev/null; then
+                ok "$(basename "$f") syntax"
+            else
+                err "$(basename "$f") syntax error"
+                fail=1
+            fi
+        fi
+    done
+    if [[ $fail -eq 0 ]]; then
+        BUILT=$((BUILT + 1))
+    else
+        FAILED=$((FAILED + 1))
+    fi
+
+    # Build if Makefile exists
+    if [[ -f "$dir/Makefile" ]]; then
+        try_build "core-agent-linux (BACKEND_VMM=kvm)" \
+            make -C "$dir" BACKEND_VMM=kvm
+    fi
+}
+
+# ── Phase 7: Build linux-utils ───────────────────────────────────
+build_linux_utils() {
+    local dir="$REPOS_DIR/qubes-linux-utils"
+    [[ -d "$dir" ]] || { log "SKIP linux-utils (not found)"; return; }
+    if [[ -f "$dir/Makefile" ]]; then
+        try_build "linux-utils (BACKEND_VMM=kvm)" \
+            make -C "$dir" BACKEND_VMM=kvm
+    else
+        log "  SKIP linux-utils (no Makefile)"
+    fi
+}
+
+# ── Phase 8: Run vchan tests ────────────────────────────────────
+run_vchan_tests() {
+    local dir="$REPOS_DIR/qubes-core-vchan-socket"
+    [[ -d "$dir" ]] || { log "SKIP vchan tests (not found)"; return; }
+    log "Running vchan tests..."
+    rm -f /tmp/vchan.*.sock
+    if (cd "$dir" && timeout 30 python3 -m unittest tests.test_vchan tests.test_integration 2>&1); then
+        BUILT=$((BUILT + 1))
+    else
+        err "vchan tests failed"
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+# ── Phase 9: Validate Python modules ────────────────────────────
+validate_python_modules() {
+    log "Validating Python modules load with BACKEND_VMM=kvm..."
+    local core_admin="$REPOS_DIR/qubes-core-admin"
+    [[ -d "$core_admin" ]] || { log "SKIP Python validation (core-admin not found)"; return; }
+
+    export PYTHONPATH="$core_admin:${PYTHONPATH:-}"
+    export QUBES_BACKEND_VMM=kvm
+
+    local fail=0
+    for mod in qubes.config qubes.vm.mix.kvm_mem; do
+        if python3 -c "import $mod" 2>/dev/null; then
+            ok "import $mod"
+        else
+            err "import $mod failed"
+            fail=1
+        fi
+    done
+    if [[ $fail -eq 0 ]]; then
+        BUILT=$((BUILT + 1))
+    else
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+# ── Build summary ────────────────────────────────────────────────
 build_summary() {
     log ""
     log "=== Build Summary ==="
     log "BACKEND_VMM: $BACKEND_VMM"
-    log "Output: $OUTPUT_DIR/"
-
-    local built=0
-    local failed=0
-    for repo_dir in "$REPOS_DIR"/*/; do
-        [[ -d "$repo_dir" ]] || continue
-        component=$(basename "$repo_dir")
-        if git -C "$repo_dir" log --oneline -1 2>/dev/null | grep -q "kvm-fork\|KVM" ; then
-            log "  PATCHED: $component"
-            ((built++))
-        else
-            log "  STOCK:   $component"
-        fi
-    done
-    log ""
-    log "Patched: $built  |  Stock: $(($(ls -d "$REPOS_DIR"/*/ 2>/dev/null | wc -l) - built))"
+    log "Built:  $BUILT"
+    log "Failed: $FAILED"
+    if [[ $FAILED -gt 0 ]]; then
+        log "RESULT: SOME BUILDS FAILED"
+        return 1
+    else
+        log "RESULT: ALL BUILDS SUCCEEDED"
+        return 0
+    fi
 }
 
-# Main
-log "=== qubes-kvm-fork build ==="
-log "Backend VMM: $BACKEND_VMM"
-log ""
+# ── Main ─────────────────────────────────────────────────────────
+if [[ "$MODE" == "container" ]]; then
+    apply_patches
+fi
 
-apply_patches
 build_vchan_socket
-build_qrexec
-build_core_admin
+build_qubesdb
+build_gui_daemon
+build_gui_agent
+build_core_agent
+build_linux_utils
+run_vchan_tests
+validate_python_modules
 build_summary

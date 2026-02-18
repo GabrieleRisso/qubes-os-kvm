@@ -1,0 +1,344 @@
+#!/bin/bash
+# xen-kvm-bridge.sh — Bridge layer for managing KVM-Xen VMs via libvirt
+#
+# This script provides the glue between qubesd and libvirt for VMs that
+# use QEMU's Xen HVM emulation. It can:
+#   - Define/start/stop Xen-emulated VMs through libvirt
+#   - Generate libvirt XML with the correct QEMU Xen emulation flags
+#   - Verify that a running VM has Xen emulation active
+#   - List all Xen-shim VMs and their status
+#
+# Usage:
+#   xen-kvm-bridge.sh define  VM_NAME DISK [MEM_MB] [VCPUS]
+#   xen-kvm-bridge.sh start   VM_NAME
+#   xen-kvm-bridge.sh stop    VM_NAME
+#   xen-kvm-bridge.sh destroy VM_NAME
+#   xen-kvm-bridge.sh undefine VM_NAME
+#   xen-kvm-bridge.sh status  VM_NAME
+#   xen-kvm-bridge.sh list
+#   xen-kvm-bridge.sh verify  VM_NAME
+#   xen-kvm-bridge.sh generate-xml VM_NAME DISK [MEM_MB] [VCPUS]
+set -euo pipefail
+
+LIBVIRT_URI="${LIBVIRT_URI:-qemu:///system}"
+XEN_VERSION="0x40013"
+VIRSH="virsh -c $LIBVIRT_URI"
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+info() { echo "[xen-kvm-bridge] $*"; }
+
+generate_domain_xml() {
+    local name="$1"
+    local disk="$2"
+    local mem="${3:-2048}"
+    local vcpus="${4:-2}"
+    local disk_abs
+    disk_abs="$(realpath "$disk" 2>/dev/null || echo "$disk")"
+
+    local disk_type="file"
+    local disk_driver_type="qcow2"
+    if [[ "$disk_abs" == /dev/* ]]; then
+        disk_type="block"
+        disk_driver_type="raw"
+    elif file "$disk_abs" 2>/dev/null | grep -qi "raw\|data"; then
+        disk_driver_type="raw"
+    fi
+
+    # OVMF detection
+    local ovmf=""
+    for f in /usr/share/edk2/ovmf/OVMF_CODE.fd \
+             /usr/share/OVMF/OVMF_CODE.fd \
+             /usr/share/edk2/xen/OVMF.fd; do
+        [[ -f "$f" ]] && ovmf="$f" && break
+    done
+
+    local loader_xml=""
+    if [[ -n "$ovmf" ]]; then
+        loader_xml="<loader readonly=\"yes\" type=\"pflash\">$ovmf</loader>"
+    fi
+
+    cat << XMLEOF
+<domain type="kvm" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
+    <name>$name</name>
+    <memory unit="MiB">$mem</memory>
+    <currentMemory unit="MiB">$mem</currentMemory>
+    <vcpu placement="static">$vcpus</vcpu>
+    <cpu mode="host-passthrough">
+        <feature name="invtsc" policy="require"/>
+    </cpu>
+    <os>
+        <type arch="x86_64" machine="q35">hvm</type>
+        $loader_xml
+        <boot dev="hd"/>
+    </os>
+    <features>
+        <pae/>
+        <acpi/>
+        <apic/>
+        <kvm>
+            <hidden state="on"/>
+        </kvm>
+    </features>
+    <clock offset="utc">
+        <timer name="rtc" tickpolicy="catchup"/>
+        <timer name="pit" tickpolicy="delay"/>
+        <timer name="hpet" present="no"/>
+    </clock>
+    <on_poweroff>destroy</on_poweroff>
+    <on_reboot>destroy</on_reboot>
+    <on_crash>destroy</on_crash>
+    <devices>
+        <emulator>/usr/bin/qemu-system-x86_64</emulator>
+        <disk type="$disk_type" device="disk">
+            <driver name="qemu" type="$disk_driver_type" cache="none"/>
+            <source ${disk_type}="${disk_abs}"/>
+            <target dev="vda" bus="virtio"/>
+        </disk>
+        <interface type="user">
+            <model type="virtio"/>
+        </interface>
+        <console type="pty">
+            <target type="serial" port="0"/>
+        </console>
+        <serial type="pty">
+            <target port="0"/>
+        </serial>
+        <channel type="unix">
+            <target type="virtio" name="org.qemu.guest_agent.0"/>
+        </channel>
+        <memballoon model="virtio">
+            <stats period="5"/>
+        </memballoon>
+        <rng model="virtio">
+            <backend model="random">/dev/urandom</backend>
+        </rng>
+    </devices>
+    <qemu:commandline>
+        <qemu:arg value="-accel"/>
+        <qemu:arg value="kvm,xen-version=$XEN_VERSION,kernel-irqchip=split,xen-evtchn=on,xen-gnttab=on"/>
+        <qemu:arg value="-cpu"/>
+        <qemu:arg value="host,+xen-vapic"/>
+        <qemu:arg value="-global"/>
+        <qemu:arg value="virtio-pci.ioeventfd=off"/>
+    </qemu:commandline>
+    <seclabel type="dynamic" model="dac" relabel="yes"/>
+</domain>
+XMLEOF
+}
+
+cmd_define() {
+    local name="${1:?Usage: $0 define VM_NAME DISK [MEM_MB] [VCPUS]}"
+    local disk="${2:?Usage: $0 define VM_NAME DISK [MEM_MB] [VCPUS]}"
+    local mem="${3:-2048}"
+    local vcpus="${4:-2}"
+
+    [[ -e "$disk" ]] || die "Disk image not found: $disk"
+
+    if $VIRSH dominfo "$name" &>/dev/null; then
+        die "Domain '$name' already exists. Undefine it first."
+    fi
+
+    info "Generating libvirt XML for Xen-on-KVM domain: $name"
+    local xml
+    xml="$(generate_domain_xml "$name" "$disk" "$mem" "$vcpus")"
+
+    info "Defining domain via libvirt..."
+    echo "$xml" | $VIRSH define /dev/stdin
+    info "Domain '$name' defined. Start with: $0 start $name"
+}
+
+cmd_start() {
+    local name="${1:?Usage: $0 start VM_NAME}"
+
+    if ! $VIRSH dominfo "$name" &>/dev/null; then
+        die "Domain '$name' not defined. Define it first."
+    fi
+
+    local state
+    state=$($VIRSH domstate "$name" 2>/dev/null || true)
+    if [[ "$state" == "running" ]]; then
+        info "Domain '$name' is already running."
+        return 0
+    fi
+
+    info "Starting Xen-on-KVM domain: $name"
+    $VIRSH start "$name"
+    info "Domain '$name' started."
+}
+
+cmd_stop() {
+    local name="${1:?Usage: $0 stop VM_NAME}"
+    info "Sending graceful shutdown to: $name"
+    $VIRSH shutdown "$name" || die "Failed to send shutdown"
+    info "Shutdown signal sent. Waiting up to 30s..."
+
+    local i=0
+    while [[ $i -lt 30 ]]; do
+        local state
+        state=$($VIRSH domstate "$name" 2>/dev/null || echo "shut off")
+        if [[ "$state" == "shut off" ]]; then
+            info "Domain '$name' has shut down."
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+
+    info "Timeout. Domain still running after 30s."
+    info "Use '$0 destroy $name' to force-kill."
+}
+
+cmd_destroy() {
+    local name="${1:?Usage: $0 destroy VM_NAME}"
+    info "Force-destroying domain: $name"
+    $VIRSH destroy "$name" || info "Domain may already be stopped."
+}
+
+cmd_undefine() {
+    local name="${1:?Usage: $0 undefine VM_NAME}"
+    local state
+    state=$($VIRSH domstate "$name" 2>/dev/null || echo "shut off")
+    if [[ "$state" == "running" ]]; then
+        die "Domain '$name' is running. Stop it first."
+    fi
+    info "Undefining domain: $name"
+    $VIRSH undefine "$name"
+    info "Domain '$name' removed."
+}
+
+cmd_status() {
+    local name="${1:?Usage: $0 status VM_NAME}"
+    if ! $VIRSH dominfo "$name" &>/dev/null; then
+        echo "Domain '$name' is not defined."
+        return 1
+    fi
+    echo "=== Domain: $name ==="
+    $VIRSH dominfo "$name"
+    echo ""
+
+    local xml
+    xml=$($VIRSH dumpxml "$name" 2>/dev/null || true)
+    if echo "$xml" | grep -q "xen-version"; then
+        echo "Xen HVM emulation: ACTIVE"
+        local xver
+        xver=$(echo "$xml" | grep -oP 'xen-version=\S+' | head -1)
+        echo "  $xver"
+    else
+        echo "Xen HVM emulation: NOT configured"
+    fi
+}
+
+cmd_list() {
+    info "Xen-on-KVM domains:"
+    echo ""
+    local domains
+    domains=$($VIRSH list --all --name 2>/dev/null | grep -v '^$' || true)
+    if [[ -z "$domains" ]]; then
+        echo "  (no domains defined)"
+        return 0
+    fi
+
+    printf "  %-30s %-12s %-10s\n" "NAME" "STATE" "XEN-SHIM"
+    printf "  %-30s %-12s %-10s\n" "----" "-----" "--------"
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        local state
+        state=$($VIRSH domstate "$name" 2>/dev/null || echo "unknown")
+        local xen_shim="no"
+        local xml
+        xml=$($VIRSH dumpxml "$name" 2>/dev/null || true)
+        if echo "$xml" | grep -q "xen-version"; then
+            xen_shim="yes"
+        fi
+        printf "  %-30s %-12s %-10s\n" "$name" "$state" "$xen_shim"
+    done <<< "$domains"
+}
+
+cmd_verify() {
+    local name="${1:?Usage: $0 verify VM_NAME}"
+
+    local state
+    state=$($VIRSH domstate "$name" 2>/dev/null || echo "undefined")
+    if [[ "$state" != "running" ]]; then
+        die "Domain '$name' is not running (state: $state)"
+    fi
+
+    echo "=== Verifying Xen emulation for: $name ==="
+
+    local xml
+    xml=$($VIRSH dumpxml "$name" 2>/dev/null || true)
+
+    local checks_passed=0 checks_total=0
+
+    checks_total=$((checks_total + 1))
+    if echo "$xml" | grep -q "xen-version"; then
+        echo "  [PASS] QEMU Xen emulation flags present"
+        checks_passed=$((checks_passed + 1))
+    else
+        echo "  [FAIL] No xen-version in domain XML"
+    fi
+
+    checks_total=$((checks_total + 1))
+    if echo "$xml" | grep -q "kernel-irqchip=split"; then
+        echo "  [PASS] kernel-irqchip=split configured"
+        checks_passed=$((checks_passed + 1))
+    else
+        echo "  [FAIL] kernel-irqchip=split not found"
+    fi
+
+    checks_total=$((checks_total + 1))
+    if echo "$xml" | grep -q "xen-vapic"; then
+        echo "  [PASS] xen-vapic CPU flag enabled"
+        checks_passed=$((checks_passed + 1))
+    else
+        echo "  [WARN] xen-vapic not found (optional but recommended)"
+    fi
+
+    checks_total=$((checks_total + 1))
+    if echo "$xml" | grep -q "xen-evtchn=on"; then
+        echo "  [PASS] Xen event channel emulation enabled"
+        checks_passed=$((checks_passed + 1))
+    else
+        echo "  [INFO] xen-evtchn not explicitly enabled"
+    fi
+
+    checks_total=$((checks_total + 1))
+    if echo "$xml" | grep -q "xen-gnttab=on"; then
+        echo "  [PASS] Xen grant table emulation enabled"
+        checks_passed=$((checks_passed + 1))
+    else
+        echo "  [INFO] xen-gnttab not explicitly enabled"
+    fi
+
+    echo ""
+    echo "  Checks: $checks_passed/$checks_total passed"
+    [[ $checks_passed -ge 2 ]] && echo "  Xen-on-KVM emulation: VERIFIED"
+}
+
+cmd_generate_xml() {
+    local name="${1:?Usage: $0 generate-xml VM_NAME DISK [MEM_MB] [VCPUS]}"
+    local disk="${2:?Usage: $0 generate-xml VM_NAME DISK [MEM_MB] [VCPUS]}"
+    local mem="${3:-2048}"
+    local vcpus="${4:-2}"
+    generate_domain_xml "$name" "$disk" "$mem" "$vcpus"
+}
+
+ACTION="${1:?Usage: $0 <define|start|stop|destroy|undefine|status|list|verify|generate-xml> [args...]}"
+shift
+
+case "$ACTION" in
+    define)       cmd_define "$@" ;;
+    start)        cmd_start "$@" ;;
+    stop)         cmd_stop "$@" ;;
+    destroy)      cmd_destroy "$@" ;;
+    undefine)     cmd_undefine "$@" ;;
+    status)       cmd_status "$@" ;;
+    list)         cmd_list ;;
+    verify)       cmd_verify "$@" ;;
+    generate-xml) cmd_generate_xml "$@" ;;
+    *)
+        echo "Unknown action: $ACTION"
+        echo "Usage: $0 <define|start|stop|destroy|undefine|status|list|verify|generate-xml> [args...]"
+        exit 1
+        ;;
+esac

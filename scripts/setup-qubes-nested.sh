@@ -31,20 +31,28 @@ readonly VM_MEM="8192"
 readonly VM_MAXMEM="16384"
 readonly VM_VCPUS="4"
 readonly VM_DISK="60G"
-readonly TEMPLATE="fedora-42"
+readonly TEMPLATE="fedora-42-xfce"
 
 log() { echo "[setup-nested] $*"; }
 
 # ── Step 1: Verify Xen nested HVM is possible ────────────────────
 log "=== Step 1: Check Xen nested HVM support ==="
 
-# Check if CPU supports VMX
-if ! grep -q vmx /proc/cpuinfo 2>/dev/null; then
-    if ! grep -q svm /proc/cpuinfo 2>/dev/null; then
-        log "ERROR: CPU does not support hardware virtualization (VMX/SVM)"
-        log "Nested HVM requires Intel VT-x or AMD-V"
-        exit 1
-    fi
+# Check if CPU supports HVM via Xen's reported capabilities.
+# NOTE: /proc/cpuinfo may NOT show vmx/svm under Xen on newer CPUs
+# (e.g. Arrow Lake) because Xen consumes the flag. Use xl info instead.
+XEN_VIRT_CAPS=$(xl info 2>/dev/null | grep '^virt_caps' | cut -d: -f2- || echo "")
+if echo "$XEN_VIRT_CAPS" | grep -q "hvm"; then
+    log "  Xen virt_caps: hvm detected (CPU supports hardware virtualization)"
+elif grep -q vmx /proc/cpuinfo 2>/dev/null; then
+    log "  CPU VMX flag: found in /proc/cpuinfo"
+elif grep -q svm /proc/cpuinfo 2>/dev/null; then
+    log "  CPU SVM flag: found in /proc/cpuinfo"
+else
+    log "ERROR: CPU does not support hardware virtualization"
+    log "  xl info virt_caps: $XEN_VIRT_CAPS"
+    log "  Nested HVM requires Intel VT-x or AMD-V"
+    exit 1
 fi
 log "  CPU virtualization extensions: OK"
 
@@ -130,9 +138,11 @@ log "=== Step 2: Create $VM_NAME StandaloneVM ==="
 if qvm-check "$VM_NAME" 2>/dev/null; then
     log "  $VM_NAME already exists"
 else
-    # Determine best template
+    # Determine best template — try -xfce variants first (they exist on most
+    # Qubes installs), then bare names, then Debian.
     AVAIL_TEMPLATE=""
-    for t in fedora-42 fedora-41 fedora-40 debian-13; do
+    for t in fedora-42-xfce fedora-43 fedora-42-nvidia fedora-42 \
+             debian-14-xfce debian-13-xfce debian-13; do
         if qvm-check "$t" 2>/dev/null; then
             AVAIL_TEMPLATE="$t"
             break
@@ -140,8 +150,10 @@ else
     done
 
     if [[ -z "$AVAIL_TEMPLATE" ]]; then
-        log "ERROR: No suitable template found (tried fedora-42/41/40, debian-13)"
-        log "Install a template first: sudo qubes-dom0-update qubes-template-fedora-42"
+        log "ERROR: No suitable template found"
+        log "Tried: fedora-42-xfce, fedora-43, fedora-42-nvidia, fedora-42,"
+        log "       debian-14-xfce, debian-13-xfce, debian-13"
+        log "Install a template first: sudo qubes-dom0-update qubes-template-fedora-42-xfce"
         exit 1
     fi
 
@@ -206,15 +218,15 @@ cat > "$LIBVIRT_FILE" << 'XMLEOF'
 {% block cpu %}
     <cpu mode='host-passthrough'>
         <feature name='vmx' policy='require'/>
+        <feature name='invtsc' policy='require'/>
     </cpu>
 {% endblock %}
 {% block features %}
-    <features>
-        <pae/>
-        <acpi/>
-        <apic/>
-        <hap/>
-    </features>
+    <pae/>
+    <acpi/>
+    <apic/>
+    <hap/>
+    <viridian/>
 {% endblock %}
 XMLEOF
 
