@@ -218,7 +218,6 @@ cat > "$LIBVIRT_FILE" << 'XMLEOF'
 {% block cpu %}
     <cpu mode='host-passthrough'>
         <feature name='vmx' policy='require'/>
-        <feature name='invtsc' policy='require'/>
     </cpu>
 {% endblock %}
 {% block features %}

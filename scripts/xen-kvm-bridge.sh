@@ -20,6 +20,8 @@
 #   xen-kvm-bridge.sh verify  VM_NAME
 #   xen-kvm-bridge.sh console VM_NAME
 #   xen-kvm-bridge.sh generate-xml VM_NAME DISK [MEM_MB] [VCPUS]
+#   xen-kvm-bridge.sh gpu-define  VM_NAME DISK PCI_ADDR [MEM_MB] [VCPUS]
+#   xen-kvm-bridge.sh gpu-list
 set -euo pipefail
 
 LIBVIRT_URI="${LIBVIRT_URI:-qemu:///system}"
@@ -490,7 +492,250 @@ cmd_generate_xml() {
     generate_domain_xml "$name" "$disk" "$mem" "$vcpus"
 }
 
-ACTION="${1:?Usage: $0 <define|start|stop|destroy|undefine|status|list|verify|generate-xml> [args...]}"
+# ── GPU / PCI Passthrough for AI Inference VMs ────────────────────
+#
+# PCI address format: DDDD:BB:SS.F (domain:bus:slot.function)
+# Example: 0000:01:00.0 (typical discrete GPU)
+#
+# Prerequisites:
+#   1. IOMMU enabled in kernel/hypervisor (intel_iommu=on or amd_iommu=on)
+#   2. GPU bound to vfio-pci driver (not nvidia/amdgpu)
+#   3. All devices in same IOMMU group passed through together
+#
+# For AI inference: pass a GPU + enough memory for model loading.
+# Typical config: 16GB+ RAM, 4+ vCPUs, one discrete GPU.
+
+parse_pci_addr() {
+    local addr="$1"
+    if [[ "$addr" =~ ^([0-9a-fA-F]{4}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-9a-fA-F])$ ]]; then
+        PCI_DOMAIN="${BASH_REMATCH[1]}"
+        PCI_BUS="${BASH_REMATCH[2]}"
+        PCI_SLOT="${BASH_REMATCH[3]}"
+        PCI_FUNC="${BASH_REMATCH[4]}"
+    elif [[ "$addr" =~ ^([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-9a-fA-F])$ ]]; then
+        PCI_DOMAIN="0000"
+        PCI_BUS="${BASH_REMATCH[1]}"
+        PCI_SLOT="${BASH_REMATCH[2]}"
+        PCI_FUNC="${BASH_REMATCH[3]}"
+    else
+        die "Invalid PCI address: $addr (expected DDDD:BB:SS.F or BB:SS.F)"
+    fi
+}
+
+generate_gpu_hostdev_xml() {
+    local addr="$1"
+    parse_pci_addr "$addr"
+    cat << PCIEOF
+        <hostdev type="pci" mode="subsystem" managed="yes">
+            <driver name="vfio"/>
+            <source>
+                <address domain="0x${PCI_DOMAIN}" bus="0x${PCI_BUS}"
+                         slot="0x${PCI_SLOT}" function="0x${PCI_FUNC}"/>
+            </source>
+        </hostdev>
+PCIEOF
+}
+
+generate_gpu_domain_xml() {
+    local name="$1"
+    local disk="$2"
+    local pci_addrs="$3"
+    local mem="${4:-16384}"
+    local vcpus="${5:-4}"
+    local disk_abs
+    disk_abs="$(realpath "$disk" 2>/dev/null || echo "$disk")"
+
+    local disk_type="file"
+    local disk_source_attr="file"
+    local disk_driver_type="qcow2"
+    if [[ "$disk_abs" == /dev/* ]]; then
+        disk_type="block"
+        disk_source_attr="dev"
+        disk_driver_type="raw"
+    elif file "$disk_abs" 2>/dev/null | grep -qi "raw\|data"; then
+        disk_driver_type="raw"
+    fi
+
+    local ovmf=""
+    for f in /usr/share/edk2/ovmf/OVMF_CODE.fd \
+             /usr/share/OVMF/OVMF_CODE.fd \
+             /usr/share/edk2/xen/OVMF.fd; do
+        [[ -f "$f" ]] && ovmf="$f" && break
+    done
+
+    local loader_xml=""
+    if [[ -n "$ovmf" ]]; then
+        loader_xml="<loader readonly=\"yes\" type=\"pflash\">$ovmf</loader>"
+    fi
+
+    local hostdev_block=""
+    local IFS=','
+    for addr in $pci_addrs; do
+        hostdev_block+="$(generate_gpu_hostdev_xml "$addr")"$'\n'
+    done
+    unset IFS
+
+    cat << XMLEOF
+<domain type="kvm" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
+    <name>$name</name>
+    <memory unit="MiB">$mem</memory>
+    <currentMemory unit="MiB">$mem</currentMemory>
+    <vcpu placement="static">$vcpus</vcpu>
+    <cpu mode="host-passthrough"/>
+    <os>
+        <type arch="x86_64" machine="q35">hvm</type>
+        $loader_xml
+        <boot dev="hd"/>
+    </os>
+    <features>
+        <pae/>
+        <acpi/>
+        <apic/>
+        <kvm>
+            <hidden state="on"/>
+        </kvm>
+        <ioapic driver="kvm"/>
+    </features>
+    <clock offset="utc">
+        <timer name="rtc" tickpolicy="catchup"/>
+        <timer name="pit" tickpolicy="delay"/>
+        <timer name="hpet" present="no"/>
+    </clock>
+    <on_poweroff>destroy</on_poweroff>
+    <on_reboot>destroy</on_reboot>
+    <on_crash>destroy</on_crash>
+    <devices>
+        <emulator>/usr/bin/qemu-system-x86_64</emulator>
+        <disk type="$disk_type" device="disk">
+            <driver name="qemu" type="$disk_driver_type" cache="none"/>
+            <source ${disk_source_attr}="${disk_abs}"/>
+            <target dev="vda" bus="virtio"/>
+        </disk>
+        <interface type="user">
+            <model type="virtio"/>
+        </interface>
+        <console type="pty">
+            <target type="serial" port="0"/>
+        </console>
+        <serial type="pty">
+            <target port="0"/>
+        </serial>
+        <channel type="unix">
+            <target type="virtio" name="org.qemu.guest_agent.0"/>
+        </channel>
+        <channel type="unix">
+            <source mode="bind" path="/var/run/qubes/qubesdb.${name}.sock"/>
+            <target type="virtio" name="org.qubes-os.qubesdb"/>
+        </channel>
+        <vsock model="virtio">
+            <cid auto="yes"/>
+        </vsock>
+        <memballoon model="virtio">
+            <stats period="5"/>
+        </memballoon>
+        <rng model="virtio">
+            <backend model="random">/dev/urandom</backend>
+        </rng>
+        <input type="tablet" bus="virtio"/>
+        <input type="keyboard" bus="virtio"/>
+$hostdev_block    </devices>
+    <qemu:commandline>
+        <qemu:arg value="-accel"/>
+        <qemu:arg value="kvm,xen-version=$XEN_VERSION,kernel-irqchip=split"/>
+        <qemu:arg value="-cpu"/>
+        <qemu:arg value="host,+xen-vapic"/>
+    </qemu:commandline>
+    <seclabel type="dynamic" model="dac" relabel="yes"/>
+</domain>
+XMLEOF
+}
+
+cmd_gpu_define() {
+    local name="${1:?Usage: $0 gpu-define VM_NAME DISK PCI_ADDR[,PCI_ADDR2,...] [MEM_MB] [VCPUS]}"
+    local disk="${2:?Provide disk image path}"
+    local pci_addrs="${3:?Provide PCI address(es), comma-separated (e.g. 01:00.0,01:00.1)}"
+    local mem="${4:-16384}"
+    local vcpus="${5:-4}"
+
+    [[ -e "$disk" ]] || die "Disk image not found: $disk"
+
+    local IFS=','
+    for addr in $pci_addrs; do
+        parse_pci_addr "$addr"
+        local sysfs="/sys/bus/pci/devices/0000:${PCI_BUS}:${PCI_SLOT}.${PCI_FUNC}/driver"
+        if [[ -L "$sysfs" ]]; then
+            local current_drv
+            current_drv="$(basename "$(readlink "$sysfs")")"
+            if [[ "$current_drv" != "vfio-pci" ]]; then
+                info "WARNING: $addr is bound to '$current_drv', not vfio-pci"
+                info "  Bind with: echo $addr > /sys/bus/pci/drivers/$current_drv/unbind"
+                info "             echo $addr > /sys/bus/pci/drivers/vfio-pci/bind"
+            fi
+        fi
+    done
+    unset IFS
+
+    if $VIRSH dominfo "$name" &>/dev/null; then
+        info "Domain '$name' already defined. Undefining first..."
+        $VIRSH destroy "$name" 2>/dev/null || true
+        $VIRSH undefine "$name" --nvram 2>/dev/null || $VIRSH undefine "$name" 2>/dev/null || true
+    fi
+
+    info "Defining GPU-passthrough Xen-on-KVM domain: $name"
+    info "  PCI devices: $pci_addrs"
+    info "  Memory: ${mem}MB, vCPUs: $vcpus"
+    local xml
+    xml="$(generate_gpu_domain_xml "$name" "$disk" "$pci_addrs" "$mem" "$vcpus")"
+    echo "$xml" | $VIRSH define /dev/stdin
+    info "Domain '$name' defined with GPU passthrough."
+    info "  Start: $0 start $name"
+    info "  Verify GPU inside guest: lspci | grep -i vga"
+}
+
+cmd_gpu_list() {
+    info "PCI devices suitable for passthrough:"
+    echo ""
+
+    if ! command -v lspci &>/dev/null; then
+        die "lspci not installed (pciutils package)"
+    fi
+
+    printf "  %-14s %-8s %-50s\n" "ADDRESS" "DRIVER" "DEVICE"
+    printf "  %-14s %-8s %-50s\n" "-------" "------" "------"
+
+    local found=0
+    while IFS= read -r line; do
+        local addr desc
+        addr="$(echo "$line" | awk '{print $1}')"
+        desc="$(echo "$line" | cut -d' ' -f2-)"
+
+        local drv="(none)"
+        local sysfs="/sys/bus/pci/devices/0000:${addr}/driver"
+        if [[ -L "$sysfs" ]]; then
+            drv="$(basename "$(readlink "$sysfs")")"
+        fi
+
+        case "$desc" in
+            *VGA*|*3D*|*Display*|*GPU*|*Accelerator*)
+                printf "  %-14s %-8s %-50s\n" "$addr" "$drv" "$desc"
+                found=$((found + 1))
+                ;;
+        esac
+    done < <(lspci 2>/dev/null || true)
+
+    echo ""
+    if [[ $found -eq 0 ]]; then
+        info "No GPU/accelerator devices found."
+    else
+        info "$found GPU/accelerator device(s) found."
+        info ""
+        info "To use a device for passthrough:"
+        info "  1. Bind to vfio-pci (unbind from nvidia/amdgpu first)"
+        info "  2. $0 gpu-define VM_NAME DISK.qcow2 BUS:SLOT.FUNC [MEM_MB] [VCPUS]"
+    fi
+}
+
+ACTION="${1:?Usage: $0 <action> [args...] — see below}"
 shift
 
 case "$ACTION" in
@@ -505,9 +750,29 @@ case "$ACTION" in
     verify)       cmd_verify "$@" ;;
     console)      cmd_console "$@" ;;
     generate-xml) cmd_generate_xml "$@" ;;
+    gpu-define)   cmd_gpu_define "$@" ;;
+    gpu-list)     cmd_gpu_list ;;
     *)
         echo "Unknown action: $ACTION"
-        echo "Usage: $0 <define|install|start|stop|destroy|undefine|status|list|verify|console|generate-xml> [args...]"
+        echo ""
+        echo "Usage: $0 <action> [args...]"
+        echo ""
+        echo "VM management:"
+        echo "  define       VM_NAME DISK [MEM] [VCPUS]        Standard Xen-on-KVM domain"
+        echo "  install      VM_NAME DISK ISO [MEM] [VCPUS]    Install from ISO"
+        echo "  start        VM_NAME                            Start domain"
+        echo "  stop         VM_NAME                            Graceful shutdown"
+        echo "  destroy      VM_NAME                            Force kill"
+        echo "  undefine     VM_NAME                            Remove domain"
+        echo "  status       VM_NAME                            Show domain info"
+        echo "  list                                            List all domains"
+        echo "  verify       VM_NAME                            Verify Xen emulation"
+        echo "  console      VM_NAME                            Serial console"
+        echo "  generate-xml VM_NAME DISK [MEM] [VCPUS]        Print XML only"
+        echo ""
+        echo "GPU passthrough (AI inference):"
+        echo "  gpu-define   VM_NAME DISK PCI[,PCI2] [MEM] [VCPUS]"
+        echo "  gpu-list                                        Show available GPUs"
         exit 1
         ;;
 esac

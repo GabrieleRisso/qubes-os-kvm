@@ -53,12 +53,15 @@ QUBES_REPOS := \
 
 .PHONY: help info setup clone build build-vchan build-qubesdb-kvm build-container \
         test test-vchan test-shellcheck test-agent-syntax test-specs test-container test-vm \
-        clean nuke rpm rpm-vchan builder-image \
+        clean nuke rpm rpm-vchan rpm-qubesdb-kvm rpm-agent-kvm rpm-all builder-image \
         vm-create vm-install vm-start vm-ssh vm-stop \
         patch-status \
         qubes-setup qubes-deploy qubes-provision qubes-test qubes-xen-test \
         qubes-arm-test qubes-build qubes-sync qubes-status qubes-ssh \
         xen-bridge-list xen-bridge-define xen-bridge-start \
+        gpu-list gpu-define \
+        lenovo-setup lenovo-test lenovo-deploy lenovo-sync lenovo-build \
+        lenovo-rtest lenovo-rpm lenovo-status lenovo-ssh lenovo-tunnel e2e \
         probe probe-all probe-p0 probe-p1 probe-p2 probe-p3 probe-p4
 
 # ── Help ──────────────────────────────────────────────────────────
@@ -91,6 +94,11 @@ help:
 	@echo ""
 	@echo "  VM_MEM=$(VM_MEM) VM_CPUS=$(VM_CPUS) VM_DISK_SIZE=$(VM_DISK_SIZE)"
 	@echo ""
+	@echo "GPU Passthrough (AI Inference):"
+	@echo "  make gpu-list                        Show available GPUs"
+	@echo "  make gpu-define VM_NAME=ai DISK=... PCI=01:00.0"
+	@echo "                                       Define VM with GPU passthrough"
+	@echo ""
 	@echo "Qubes-Native (from visyble, via qvm-remote):"
 	@echo "  make qubes-setup     Create kvm-dev qube with nested KVM"
 	@echo "  make qubes-deploy    Copy project into kvm-dev qube"
@@ -102,6 +110,21 @@ help:
 	@echo "  make qubes-sync      Quick-sync source changes"
 	@echo "  make qubes-status    Show kvm-dev state"
 	@echo "  make qubes-ssh       Shell into kvm-dev"
+	@echo ""
+	@echo "Lenovo Remote (from Qubes visyble VM via SSH):"
+	@echo "  make lenovo-setup LENOVO_IP=x.x.x.x"
+	@echo "                                       First-time SSH configuration"
+	@echo "  make lenovo-deploy                    Upload project to Lenovo"
+	@echo "  make lenovo-sync                      Quick rsync source changes"
+	@echo "  make lenovo-build                     Run build on Lenovo"
+	@echo "  make lenovo-rtest                     Run tests on Lenovo"
+	@echo "  make lenovo-rpm                       Build RPMs on Lenovo"
+	@echo "  make lenovo-status                    Show Lenovo system status"
+	@echo "  make lenovo-ssh                       Interactive shell on Lenovo"
+	@echo "  make lenovo-tunnel                    SSH port-forward (agent API)"
+	@echo ""
+	@echo "Integration:"
+	@echo "  make e2e                              Full end-to-end KVM test"
 	@echo ""
 	@echo "Cleanup:"
 	@echo "  make clean           Remove build artifacts"
@@ -259,8 +282,12 @@ test-container:
 
 VCHAN_VERSION := $(shell cat $(VCHAN_DIR)/version 2>/dev/null || echo 4.3.0)
 
-rpm: rpm-vchan
+rpm: rpm-vchan rpm-qubesdb-kvm rpm-agent-kvm
+	@echo ""
+	@echo "=== All RPMs built ==="
 	@echo "RPM artifacts in $(BUILD_DIR)/rpmbuild/RPMS/"
+
+rpm-all: rpm
 
 rpm-vchan: build-vchan
 	@mkdir -p $(BUILD_DIR)/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
@@ -282,7 +309,65 @@ rpm-vchan: build-vchan
 	rpmbuild -bb \
 		--define "_topdir $(CURDIR)/$(BUILD_DIR)/rpmbuild" \
 		--define "backend_vmm kvm" \
+		--define "debug_package %{nil}" \
 		$(BUILD_DIR)/rpmbuild/SPECS/libvchan-socket.spec
+
+QUBESDB_KVM_VERSION := 4.3.0
+AGENT_KVM_VERSION   := 4.3.0
+
+rpm-qubesdb-kvm: build-qubesdb-kvm
+	@mkdir -p $(BUILD_DIR)/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+	@echo "=== Preparing qubesdb-kvm tarball ==="
+	@rm -rf /tmp/qubes-qubesdb-kvm-$(QUBESDB_KVM_VERSION)
+	@mkdir -p /tmp/qubes-qubesdb-kvm-$(QUBESDB_KVM_VERSION)/daemon/kvm
+	@mkdir -p /tmp/qubes-qubesdb-kvm-$(QUBESDB_KVM_VERSION)/include
+	@cp -a $(QUBESDB_DIR)/daemon/kvm/Makefile \
+		$(QUBESDB_DIR)/daemon/kvm/qubesdb-config-inject.c \
+		$(QUBESDB_DIR)/daemon/kvm/qubesdb-config-read.c \
+		/tmp/qubes-qubesdb-kvm-$(QUBESDB_KVM_VERSION)/daemon/kvm/
+	@if [ -f "$(QUBESDB_DIR)/daemon/kvm/qubesdb-config-read.service" ]; then \
+		cp -a $(QUBESDB_DIR)/daemon/kvm/qubesdb-config-read.service \
+			/tmp/qubes-qubesdb-kvm-$(QUBESDB_KVM_VERSION)/daemon/kvm/; \
+	fi
+	@cp -a $(QUBESDB_DIR)/include/qubesdb.h \
+		/tmp/qubes-qubesdb-kvm-$(QUBESDB_KVM_VERSION)/include/
+	@tar czf $(BUILD_DIR)/rpmbuild/SOURCES/qubes-qubesdb-kvm-$(QUBESDB_KVM_VERSION).tar.gz \
+		-C /tmp qubes-qubesdb-kvm-$(QUBESDB_KVM_VERSION)
+	@rm -rf /tmp/qubes-qubesdb-kvm-$(QUBESDB_KVM_VERSION)
+	@cp rpm_specs/qubesdb-kvm.spec $(BUILD_DIR)/rpmbuild/SPECS/
+	@echo "=== Building qubesdb-kvm RPM ==="
+	rpmbuild -bb \
+		--define "_topdir $(CURDIR)/$(BUILD_DIR)/rpmbuild" \
+		--define "debug_package %{nil}" \
+		$(BUILD_DIR)/rpmbuild/SPECS/qubesdb-kvm.spec
+
+rpm-agent-kvm:
+	@mkdir -p $(BUILD_DIR)/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+	@echo "=== Preparing agent-kvm tarball ==="
+	@rm -rf /tmp/qubes-core-agent-kvm-$(AGENT_KVM_VERSION)
+	@mkdir -p /tmp/qubes-core-agent-kvm-$(AGENT_KVM_VERSION)/{init,network,vm-systemd}
+	@cp -a $(AGENT_DIR)/init/hypervisor.sh \
+		$(AGENT_DIR)/init/qubes-domain-id.sh \
+		/tmp/qubes-core-agent-kvm-$(AGENT_KVM_VERSION)/init/
+	@cp -a $(AGENT_DIR)/network/vif-route-qubes-kvm \
+		/tmp/qubes-core-agent-kvm-$(AGENT_KVM_VERSION)/network/
+	@cp -a $(AGENT_DIR)/network/qubes-vhost-bridge.py \
+		/tmp/qubes-core-agent-kvm-$(AGENT_KVM_VERSION)/network/
+	@cp -a $(AGENT_DIR)/network/qubesdb-hotplug-watcher.sh \
+		/tmp/qubes-core-agent-kvm-$(AGENT_KVM_VERSION)/network/
+	@cp -a $(AGENT_DIR)/vm-systemd/qubes-vhost-bridge.service \
+		/tmp/qubes-core-agent-kvm-$(AGENT_KVM_VERSION)/vm-systemd/
+	@cp -a $(AGENT_DIR)/vm-systemd/qubes-kvm-hotplug-watcher.service \
+		/tmp/qubes-core-agent-kvm-$(AGENT_KVM_VERSION)/vm-systemd/
+	@tar czf $(BUILD_DIR)/rpmbuild/SOURCES/qubes-core-agent-kvm-$(AGENT_KVM_VERSION).tar.gz \
+		-C /tmp qubes-core-agent-kvm-$(AGENT_KVM_VERSION)
+	@rm -rf /tmp/qubes-core-agent-kvm-$(AGENT_KVM_VERSION)
+	@cp rpm_specs/qubes-agent-kvm.spec $(BUILD_DIR)/rpmbuild/SPECS/
+	@echo "=== Building agent-kvm RPM ==="
+	rpmbuild -bb \
+		--define "_topdir $(CURDIR)/$(BUILD_DIR)/rpmbuild" \
+		--define "debug_package %{nil}" \
+		$(BUILD_DIR)/rpmbuild/SPECS/qubes-agent-kvm.spec
 
 # ── VM Image Management ──────────────────────────────────────────
 
@@ -418,10 +503,60 @@ xen-bridge-start:
 	@test -n "$(VM_NAME)" || (echo "Usage: make xen-bridge-start VM_NAME=myvm" && exit 1)
 	$(SCRIPT_DIR)/xen-kvm-bridge.sh start $(VM_NAME)
 
+# GPU passthrough for AI inference
+gpu-list:
+	$(SCRIPT_DIR)/xen-kvm-bridge.sh gpu-list
+
+gpu-define:
+	@test -n "$(VM_NAME)" || (echo "Usage: make gpu-define VM_NAME=ai-vm DISK=/path PCI=01:00.0" && exit 1)
+	@test -n "$(DISK)" || (echo "Usage: make gpu-define VM_NAME=ai-vm DISK=/path PCI=01:00.0" && exit 1)
+	@test -n "$(PCI)" || (echo "Usage: make gpu-define VM_NAME=ai-vm DISK=/path PCI=01:00.0" && exit 1)
+	$(SCRIPT_DIR)/xen-kvm-bridge.sh gpu-define $(VM_NAME) $(DISK) $(PCI) $(VM_MEM) $(VM_CPUS)
+
+# ── Lenovo Remote Development ─────────────────────────────────────
+
+LENOVO_SCRIPT := $(SCRIPT_DIR)/connect-qubes-to-lenovo.sh
+
+lenovo-setup:
+	@test -n "$(LENOVO_IP)" || (echo "Usage: make lenovo-setup LENOVO_IP=192.168.x.x" && exit 1)
+	bash $(LENOVO_SCRIPT) setup $(LENOVO_IP)
+
+lenovo-test:
+	bash $(LENOVO_SCRIPT) test
+
+lenovo-deploy:
+	bash $(LENOVO_SCRIPT) deploy
+
+lenovo-sync:
+	bash $(LENOVO_SCRIPT) sync
+
+lenovo-build:
+	bash $(LENOVO_SCRIPT) build
+
+lenovo-rtest:
+	bash $(LENOVO_SCRIPT) rtest
+
+lenovo-rpm:
+	bash $(LENOVO_SCRIPT) rpm
+
+lenovo-status:
+	bash $(LENOVO_SCRIPT) status
+
+lenovo-ssh:
+	bash $(LENOVO_SCRIPT) ssh
+
+lenovo-tunnel:
+	bash $(LENOVO_SCRIPT) tunnel
+
+# ── End-to-End Integration Test (on real KVM hardware) ────────────
+
+e2e:
+	bash $(TEST_DIR)/e2e-kvm-hardware.sh
+
 # ── Cleanup ───────────────────────────────────────────────────────
 
 clean:
-	rm -rf $(BUILD_DIR)/rpms $(BUILD_DIR)/build-*
+	rm -rf $(BUILD_DIR)/rpms $(BUILD_DIR)/build-* $(BUILD_DIR)/rpmbuild
 
 nuke:
 	rm -rf $(BUILD_DIR) $(VM_DIR)/*.qcow2

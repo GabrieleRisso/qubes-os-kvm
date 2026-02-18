@@ -1,0 +1,22 @@
+[Unit]
+Description=Qubes KVM Development Agent
+Documentation=https://github.com/QubesOS/qubes-core-admin
+After=network-online.target libvirtd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=user
+Group=user
+WorkingDirectory=/home/user/qubes-kvm-fork
+ExecStart=/home/user/qubes-kvm-fork/lenovo-agent/.venv/bin/python -m uvicorn agent:app --host 0.0.0.0 --port 8420 --log-level info --app-dir /home/user/qubes-kvm-fork/lenovo-agent
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+Environment=HOME=/home/user
+Environment=PATH=/home/user/qubes-kvm-fork/lenovo-agent/.venv/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

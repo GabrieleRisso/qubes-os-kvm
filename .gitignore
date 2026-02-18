@@ -1,8 +1,16 @@
 build/repos/
 build/rpms/
 build/build-*/
+build/rpmbuild/
 vm-images/*.qcow2
 vm-images/*.iso
 vm-images/*.img
 *.pid
 /tmp/
+*.o
+*.so
+*.a
+__pycache__/
+*.pyc
+lenovo-agent/.venv/
+.qubes-kvm-lenovo.conf

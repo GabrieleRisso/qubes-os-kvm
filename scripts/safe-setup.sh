@@ -24,7 +24,8 @@ readonly VM_MEM="8192"
 readonly VM_MAXMEM="16384"
 readonly VM_VCPUS="6"
 readonly VM_DISK="60G"
-readonly PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+readonly PROJECT_DIR
 
 DRY_RUN=false
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -312,7 +313,6 @@ phase3_create_vm() {
 {% block cpu %}
     <cpu mode='host-passthrough'>
         <feature name='vmx' policy='require'/>
-        <feature name='invtsc' policy='require'/>
     </cpu>
 {% endblock %}
 {% block features %}
@@ -569,6 +569,111 @@ phase5_test() {
     info "Shell cmd:  qvm-remote \"qvm-run --pass-io --no-gui $VM_NAME -- <command>\""
 }
 
+# ── Phase 6: GPU Passthrough for AI Inference VM ─────────────────
+
+phase6_gpu() {
+    sep
+    log "=== Phase 6: GPU Passthrough for AI Inference ==="
+    sep
+
+    log "Checking $VM_NAME is running..."
+    local STATE
+    STATE=$(dom0_read "qvm-check --running $VM_NAME 2>/dev/null && echo RUNNING || echo STOPPED")
+    if [[ "$STATE" == *"STOPPED"* ]]; then
+        log "Starting $VM_NAME..."
+        dom0 "qvm-start $VM_NAME"
+        if ! $DRY_RUN; then
+            sleep 15
+        fi
+    fi
+
+    sep
+    log "Step 6a: Checking IOMMU and GPU availability in dom0..."
+    if ! $DRY_RUN; then
+        dom0_read "echo 'IOMMU groups:'; ls /sys/kernel/iommu_groups/ 2>/dev/null | wc -l; echo 'GPU devices:'; lspci 2>/dev/null | grep -iE 'VGA|3D|Display|GPU|Accelerator' || echo '  (none found)'"
+    else
+        log "[DRY-RUN] Would check IOMMU groups and list GPU devices"
+    fi
+
+    sep
+    log "Step 6b: Installing AI inference dependencies inside $VM_NAME..."
+    info "This installs Python ML libraries, CUDA/ROCm support, and container tools"
+    info "for running local AI models via GPU passthrough."
+
+    if ! confirm "Install AI inference tools inside $VM_NAME?"; then
+        log "Skipping AI tools install."
+    else
+        dom0 "qvm-run --pass-io --no-gui $VM_NAME -- sudo dnf install -y \
+python3-pip python3-numpy python3-scipy \
+pciutils lshw \
+2>&1 | tail -5"
+
+        dom0 "qvm-run --pass-io --no-gui $VM_NAME -- bash -c '
+pip install --user torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -3
+pip install --user transformers accelerate safetensors sentencepiece 2>&1 | tail -3
+pip install --user llama-cpp-python 2>&1 | tail -3
+echo AI_TOOLS_DONE
+'" || warn "Some AI packages may have failed (can be installed manually later)"
+    fi
+
+    sep
+    log "Step 6c: Creating AI inference VM disk image..."
+    info "This creates a dedicated qcow2 disk for the GPU-passthrough VM."
+
+    if ! confirm "Create AI inference VM disk (40G) inside $VM_NAME?"; then
+        log "Skipping VM disk creation."
+    else
+        dom0 "qvm-run --pass-io --no-gui $VM_NAME -- bash -c '
+mkdir -p /home/user/vm-images
+if [ ! -f /home/user/vm-images/ai-inference.qcow2 ]; then
+    qemu-img create -f qcow2 /home/user/vm-images/ai-inference.qcow2 40G
+    echo DISK_CREATED
+else
+    echo DISK_EXISTS
+fi
+'"
+    fi
+
+    sep
+    log "Step 6d: Verifying GPU passthrough tools..."
+    if ! $DRY_RUN; then
+        dom0_read "qvm-run --pass-io --no-gui $VM_NAME -- bash -c '
+echo \"=== GPU Passthrough Readiness ===\"
+echo \"QEMU: \$(qemu-system-x86_64 --version 2>/dev/null | head -1 || echo NOT_FOUND)\"
+echo \"libvirt: \$(virsh --version 2>/dev/null || echo NOT_FOUND)\"
+echo \"VFIO modules:\"
+lsmod 2>/dev/null | grep -E \"vfio|iommu\" || echo \"  (none loaded -- expected in nested env)\"
+echo \"\"
+echo \"xen-kvm-bridge GPU commands:\"
+if [ -f /home/user/qubes-kvm-fork/scripts/xen-kvm-bridge.sh ]; then
+    bash /home/user/qubes-kvm-fork/scripts/xen-kvm-bridge.sh gpu-list 2>/dev/null || echo \"  (no GPU visible in nested env -- expected)\"
+    echo GPU_TOOLS_OK
+else
+    echo \"  xen-kvm-bridge.sh not deployed yet\"
+    echo GPU_TOOLS_MISSING
+fi
+'"
+    fi
+
+    sep
+    log "Phase 6 complete."
+    log ""
+    log "GPU passthrough workflow:"
+    info "1. On the Lenovo host (bare metal KVM), bind GPU to vfio-pci:"
+    info "   echo 0000:01:00.0 > /sys/bus/pci/drivers/nvidia/unbind"
+    info "   echo 0000:01:00.0 > /sys/bus/pci/drivers/vfio-pci/bind"
+    info "2. Define the AI inference VM with GPU:"
+    info "   make gpu-define VM_NAME=ai-inference DISK=vm-images/ai-inference.qcow2 PCI=01:00.0"
+    info "3. Start and connect:"
+    info "   make xen-bridge-start VM_NAME=ai-inference"
+    info "   make xen-bridge-console VM_NAME=ai-inference"  # typo fix below
+    log ""
+    log "For nested testing (inside kvm-dev on Qubes):"
+    info "GPU passthrough is not available (nested VFIO not supported)."
+    info "Use CPU inference (llama-cpp-python, ggml) for testing model loading."
+    info "Full GPU passthrough requires the Lenovo bare-metal KVM host."
+}
+
 # ── Main ──────────────────────────────────────────────────────────
 
 main() {
@@ -603,6 +708,9 @@ main() {
         phase5|test|verify)
             phase5_test
             ;;
+        phase6|gpu|ai)
+            phase6_gpu
+            ;;
         all)
             phase0_status
             echo ""
@@ -631,9 +739,13 @@ main() {
             if confirm "Proceed to Phase 5 (Verify Tiers)?"; then
                 phase5_test
             fi
+            echo ""
+            if confirm "Proceed to Phase 6 (GPU Passthrough / AI Inference)?"; then
+                phase6_gpu
+            fi
             ;;
         *)
-            echo "Usage: $PROGNAME [--dry-run] [phase0|phase1|phase2|phase3|phase4|phase5|status|all]"
+            echo "Usage: $PROGNAME [--dry-run] [phase0|phase1|...|phase6|status|all]"
             echo ""
             echo "Phases:"
             echo "  status/phase0  Read-only system check"
@@ -642,6 +754,7 @@ main() {
             echo "  phase3         Create kvm-dev StandaloneVM"
             echo "  phase4         Provision and deploy project"
             echo "  phase5/test    Verify all three tiers"
+            echo "  phase6/gpu/ai  GPU passthrough for AI inference"
             echo "  all            Run all phases interactively"
             echo ""
             echo "Options:"
