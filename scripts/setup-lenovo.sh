@@ -64,37 +64,62 @@ check_hardware() {
 
 # ── Step 2: Install packages ────────────────────────────────────
 
+ensure_yay() {
+    if command -v yay &>/dev/null; then
+        return 0
+    fi
+    log "  Installing yay (AUR helper)..."
+    local tmp
+    tmp="$(mktemp -d)"
+    git clone https://aur.archlinux.org/yay-bin.git "$tmp/yay-bin"
+    (cd "$tmp/yay-bin" && makepkg -si --noconfirm)
+    rm -rf "$tmp"
+}
+
+pkg_install() {
+    yay -S --needed --noconfirm "$@"
+}
+
 install_packages() {
     log "=== Step 2: Install Packages ==="
 
-    log "Updating system..."
-    sudo pacman -Syu --noconfirm
+    ensure_yay
 
-    log "Installing build + virtualization packages..."
-    sudo pacman -S --needed --noconfirm \
-        base-devel git cmake meson ninja \
-        python python-pip python-virtualenv python-pytest python-setuptools \
-        qemu-base qemu-system-x86 qemu-system-aarch64 qemu-img \
-        libvirt virt-manager dnsmasq iptables-nft nftables \
-        podman buildah skopeo \
-        edk2-ovmf swtpm \
-        openssh wget curl jq rsync tmux htop \
-        shellcheck \
-        rust \
-        rpm-tools \
-        pciutils usbutils lshw
+    log "Syncing package databases..."
+    yay -Sy --noconfirm
+
+    log "Installing build tools..."
+    pkg_install base-devel git cmake meson ninja
+
+    log "Installing Python + uv..."
+    pkg_install python python-pip python-setuptools python-lxml uv
+
+    log "Installing QEMU / KVM..."
+    pkg_install qemu-base qemu-system-x86 qemu-system-aarch64 qemu-img
+
+    log "Installing libvirt + virt-manager..."
+    pkg_install libvirt virt-manager dnsmasq iptables-nft nftables
+
+    log "Installing container tools..."
+    pkg_install podman buildah skopeo
+
+    log "Installing firmware / TPM..."
+    pkg_install edk2-ovmf swtpm
+
+    log "Installing CLI utilities..."
+    pkg_install openssh wget curl jq rsync tmux htop
+
+    log "Installing dev tools..."
+    pkg_install shellcheck rust rpm-tools
+
+    log "Installing hardware introspection..."
+    pkg_install pciutils usbutils lshw
 
     log "Installing ARM64 cross-compilation tools..."
-    sudo pacman -S --needed --noconfirm \
-        aarch64-linux-gnu-gcc aarch64-linux-gnu-binutils \
-        2>/dev/null || warn "ARM64 cross-compiler not available — install from AUR if needed"
+    pkg_install aarch64-linux-gnu-gcc aarch64-linux-gnu-binutils \
+        || warn "ARM64 cross-compiler not available in repos"
 
-    log "Installing Python AI/ML dependencies..."
-    pip install --user --break-system-packages \
-        fastapi uvicorn httpx websockets \
-        crawl4ai aiohttp beautifulsoup4 \
-        pydantic rich \
-        2>/dev/null || warn "Some Python packages failed — will retry in venv"
+    log "Python agent dependencies will be installed via uv (Step 7)."
 }
 
 # ── Step 3: Enable KVM + libvirt ─────────────────────────────────
@@ -142,7 +167,9 @@ setup_iommu() {
     log "=== Step 4: IOMMU / GPU Passthrough Setup ==="
 
     local iommu_active=false
-    if dmesg 2>/dev/null | grep -qi "IOMMU enabled\|DMAR.*IOMMU\|AMD-Vi"; then
+    local dmesg_output
+    dmesg_output="$(sudo dmesg 2>/dev/null || journalctl -k --no-pager 2>/dev/null || true)"
+    if echo "$dmesg_output" | grep -qi "IOMMU enabled\|DMAR.*IOMMU\|AMD-Vi"; then
         iommu_active=true
         log "  IOMMU: ACTIVE"
     fi
@@ -261,28 +288,66 @@ setup_agent() {
         return 1
     fi
 
+    if ! command -v uv &>/dev/null; then
+        warn "uv not found — falling back to pip"
+        local use_uv=false
+    else
+        local use_uv=true
+    fi
+
     log "  Creating Python virtual environment..."
-    if [[ ! -d "$AGENT_DIR/.venv" ]]; then
-        python -m venv "$AGENT_DIR/.venv"
+    rm -rf "$AGENT_DIR/.venv"
+    if $use_uv; then
+        uv venv --system-site-packages "$AGENT_DIR/.venv"
+    else
+        python -m venv --system-site-packages "$AGENT_DIR/.venv"
     fi
 
     log "  Installing agent dependencies..."
-    "$AGENT_DIR/.venv/bin/pip" install -q \
-        -r "$AGENT_DIR/requirements.txt" 2>&1 | tail -3
-
-    log "  Installing systemd service..."
-    local service_src="$AGENT_DIR/qubes-kvm-agent.service"
-    if [[ -f "$service_src" ]]; then
-        sudo cp "$service_src" /etc/systemd/system/
-        sudo systemctl daemon-reload
-        sudo systemctl enable qubes-kvm-agent
-        sudo systemctl restart qubes-kvm-agent
-        log "  Agent service: STARTED"
-        log "  Status: sudo systemctl status qubes-kvm-agent"
-        log "  Logs: journalctl -u qubes-kvm-agent -f"
+    if $use_uv; then
+        uv pip install --python "$AGENT_DIR/.venv/bin/python" \
+            -r "$AGENT_DIR/requirements.txt"
     else
-        warn "Service file not found: $service_src"
+        "$AGENT_DIR/.venv/bin/pip" install -q \
+            -r "$AGENT_DIR/requirements.txt" 2>&1 | tail -5
     fi
+
+    log "  Generating systemd service for current user/paths..."
+    local current_user
+    current_user="$(whoami)"
+    local service_dest="/etc/systemd/system/qubes-kvm-agent.service"
+
+    sudo tee "$service_dest" >/dev/null <<SVCEOF
+[Unit]
+Description=Qubes KVM Development Agent
+Documentation=https://github.com/QubesOS/qubes-core-admin
+After=network-online.target libvirtd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${current_user}
+Group=${current_user}
+WorkingDirectory=${PROJECT_DIR}
+ExecStart=${AGENT_DIR}/.venv/bin/python -m uvicorn agent:app --host 0.0.0.0 --port 8420 --log-level info --app-dir ${AGENT_DIR}
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+Environment=HOME=${HOME}
+Environment=PATH=${AGENT_DIR}/.venv/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable qubes-kvm-agent
+    sudo systemctl restart qubes-kvm-agent
+    log "  Agent service: STARTED"
+    log "  Status: sudo systemctl status qubes-kvm-agent"
+    log "  Logs: journalctl -u qubes-kvm-agent -f"
 
     local local_ip
     local_ip="$(ip -4 addr show scope global | grep -oP 'inet \K[\d.]+' | head -1 || echo 'localhost')"
@@ -313,7 +378,8 @@ setup_vm_images() {
 
     if [[ -f "vm-images/$cloud_img" ]] && [[ ! -f "vm-images/test-fedora.qcow2" ]]; then
         log "  Creating test VM snapshot..."
-        qemu-img create -f qcow2 -b "$cloud_img" -F qcow2 \
+        qemu-img create -f qcow2 \
+            -b "$PROJECT_DIR/vm-images/$cloud_img" -F qcow2 \
             "vm-images/test-fedora.qcow2" 40G
     fi
 
@@ -332,7 +398,7 @@ run_check() {
     local pass=0 fail=0
 
     check_item() {
-        if eval "$2" 2>/dev/null; then
+        if eval "$2" &>/dev/null; then
             printf "  [PASS] %s\n" "$1"
             pass=$((pass + 1))
         else
@@ -341,20 +407,22 @@ run_check() {
         fi
     }
 
-    check_item "/dev/kvm present" "test -e /dev/kvm"
-    check_item "QEMU x86 installed" "command -v qemu-system-x86_64"
-    check_item "QEMU ARM64 installed" "command -v qemu-system-aarch64"
-    check_item "libvirtd running" "systemctl is-active libvirtd"
-    check_item "sshd running" "systemctl is-active sshd"
-    check_item "podman available" "command -v podman"
-    check_item "gcc available" "command -v gcc"
-    check_item "rust available" "command -v cargo"
-    check_item "Python 3 available" "command -v python3 || command -v python"
-    check_item "ShellCheck available" "command -v shellcheck"
-    check_item "Nested virt enabled" "cat /sys/module/kvm_intel/parameters/nested 2>/dev/null | grep -q Y || cat /sys/module/kvm_amd/parameters/nested 2>/dev/null | grep -q 1"
-    check_item "VFIO module loaded" "lsmod | grep -q vfio"
-    check_item "Agent service running" "systemctl is-active qubes-kvm-agent 2>/dev/null"
-    check_item "Agent API responding" "curl -sf http://localhost:8420/health"
+    check_item "/dev/kvm present"       "test -e /dev/kvm"
+    check_item "QEMU x86 installed"     "command -v qemu-system-x86_64"
+    check_item "QEMU ARM64 installed"   "command -v qemu-system-aarch64"
+    check_item "libvirtd running"       "systemctl is-active libvirtd || systemctl is-active libvirtd.socket"
+    check_item "sshd running"           "systemctl is-active sshd"
+    check_item "podman available"       "command -v podman"
+    check_item "gcc available"          "command -v gcc"
+    check_item "rust available"         "command -v cargo"
+    check_item "Python 3 available"     "command -v python3 || command -v python"
+    check_item "uv available"           "command -v uv"
+    check_item "yay available"          "command -v yay"
+    check_item "ShellCheck available"   "command -v shellcheck"
+    check_item "Nested virt enabled"    "cat /sys/module/kvm_intel/parameters/nested 2>/dev/null | grep -q Y || cat /sys/module/kvm_amd/parameters/nested 2>/dev/null | grep -q 1"
+    check_item "VFIO module loaded"     "lsmod | grep vfio >/dev/null"
+    check_item "Agent service running"  "systemctl is-active qubes-kvm-agent"
+    check_item "Agent API responding"   "curl -sf http://localhost:8420/health"
 
     echo ""
     log "Results: $pass passed, $fail failed"
